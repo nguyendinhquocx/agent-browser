@@ -1420,6 +1420,24 @@ To bind to a specific port, set `AGENT_BROWSER_STREAM_PORT`:
 AGENT_BROWSER_STREAM_PORT=9223 agent-browser open example.com
 ```
 
+Frame encoding is daemon-wide:
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGENT_BROWSER_STREAM_QUALITY` | `80` | JPEG quality, 0 to 100 |
+| `AGENT_BROWSER_STREAM_MAX_WIDTH` | the viewport | Caps frame width in pixels |
+| `AGENT_BROWSER_STREAM_MAX_HEIGHT` | the viewport | Caps frame height in pixels |
+
+Width and height cap the encoded frame and leave the page size alone, so a portrait or HiDPI viewport keeps its resolution unless you cap it. The live stream requests jpeg. An explicit `screencast_start` reconfigures the same screencast, so a client can see the format change mid-stream. On a busy page at 1280x720, quality 80 costs about 54 KB per frame, quality 20 about 25 KB, and quality 20 at 640x360 about 9 KB.
+
+```bash
+# Cheaper frames for a constrained link
+AGENT_BROWSER_STREAM_QUALITY=20 \
+AGENT_BROWSER_STREAM_MAX_WIDTH=640 \
+AGENT_BROWSER_STREAM_MAX_HEIGHT=360 \
+agent-browser open example.com
+```
+
 You can also manage streaming at runtime with `stream enable`, `stream disable`, and `stream status`:
 
 ```bash
@@ -1497,7 +1515,7 @@ Connect to `ws://localhost:9223` to receive frames and send input:
 }
 ```
 
-Frames are delivered latest-first: the server picks the newest frame at send time, so frames produced while an earlier one is still being written are skipped rather than queued. `maxFps` (1 to 120, `0` = uncapped) limits delivery for that client only. A client that sends `{"type":"config","pacing":"ack"}` receives one frame at a time and acknowledges it with `{"type":"ack","seq":N}`, so nothing stale reaches the socket even if that client stalls; in the default push pacing, frames already handed to the transport are still delivered in order. Both settings can also be declared on the URL (`ws://127.0.0.1:<port>/?pacing=ack&maxFps=10`), which is the only way to cover the connection's opening frame. Input events are read on a dedicated task per connection, so clicks and keystrokes dispatch immediately even while frames are mid-write to a slow client.
+Frames are delivered latest-first: the server picks the newest frame at send time, so frames produced while an earlier one is still being written are skipped rather than queued. `maxFps` (1 to 120, `0` = uncapped) limits delivery for that client only. A client that sends `{"type":"config","pacing":"ack"}` receives one frame at a time and acknowledges it with `{"type":"ack","seq":N}`, so nothing stale reaches the socket even if that client stalls; in the default push pacing, frames already handed to the transport are still delivered in order. Both settings can also be declared on the URL (`ws://127.0.0.1:<port>/?pacing=ack&maxFps=10`), which is the only way to cover the connection's opening frame. Input events are read on a dedicated task per connection, so clicks and keystrokes dispatch immediately even while frames are mid-write to a slow client. They are sent to the browser without waiting for its reply, so a click stays responsive behind a burst of mouse moves, and ordering is preserved.
 
 ## Architecture
 
