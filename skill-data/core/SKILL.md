@@ -342,13 +342,13 @@ agent-browser network har stop /tmp/trace.har
 
 ```bash
 agent-browser open https://example.com
-agent-browser record start demo.webm          # records the current page in place, 30 fps
+agent-browser record start demo.webm          # 30 fps by default; .webm or .mp4
 agent-browser snapshot -i
 agent-browser click @e3
 agent-browser record stop
 ```
 
-`record start` attaches to the active tab as-is (no new context, no navigation unless you pass a URL). To record in a separate tab, run `tab new <url>` first. Pass `--fps 60` for motion-heavy takes (drag, animation, scroll work) or a lower rate for long sessions; `--fps` accepts 1 to 60.
+`record start` attaches to the active tab as-is (no new context, no navigation unless you pass a URL). To record in a separate tab, run `tab new <url>` first. Recording needs `ffmpeg` on PATH (`brew install ffmpeg` / `apt install ffmpeg`); `agent-browser doctor` checks for it. Pass `--fps 60` for motion-heavy takes (drag, animation, scroll work) or a lower rate for long sessions; `--fps` accepts 1 to 60.
 
 See [references/video-recording.md](references/video-recording.md) for frame rate guidance, codec options, and more.
 
@@ -386,6 +386,8 @@ agent-browser dialog dismiss          # cancel
 ```
 
 ## Diagnosing install issues
+
+On Windows, locally launched headless Chrome uses a private desktop to prevent visible desktop rectangles in affected Chromium versions. Browser automation, screenshots, and GPU rendering remain available through CDP. Use `--headed` when the browser needs to be visible; sessions with extensions also use the interactive desktop. The daemon owns its Chrome process tree and Windows terminates that tree even if the daemon is forcibly killed. Browsers attached through `--cdp` or `--auto-connect` remain externally owned.
 
 If a command fails unexpectedly (`Unknown command`, `Failed to connect`, stale daemons, version mismatches after `upgrade`, missing Chrome, etc.) run `doctor` before anything else:
 

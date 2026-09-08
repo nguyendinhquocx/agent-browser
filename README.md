@@ -418,7 +418,7 @@ agent-browser trace start             # Start recording trace
 agent-browser trace stop [path]       # Stop and save trace
 agent-browser profiler start          # Start Chrome DevTools profiling
 agent-browser profiler stop [path]    # Stop and save profile (.json)
-agent-browser record start ./demo.webm           # Start video recording at 30 fps
+agent-browser record start ./demo.webm           # Start video recording at 30 fps (.webm or .mp4; needs ffmpeg on PATH)
 agent-browser record start ./demo.webm --fps 60  # 60 fps for motion-heavy takes (1-60 allowed)
 agent-browser record stop                        # Stop and save the video
 agent-browser record restart ./take2.webm        # Stop the current recording, start a new one
@@ -1002,7 +1002,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--screenshot-dir <path>` | Default screenshot output directory (or `AGENT_BROWSER_SCREENSHOT_DIR` env) |
 | `--screenshot-quality <n>` | JPEG quality 0-100 (or `AGENT_BROWSER_SCREENSHOT_QUALITY` env) |
 | `--screenshot-format <fmt>` | Screenshot format: `png`, `jpeg` (or `AGENT_BROWSER_SCREENSHOT_FORMAT` env) |
-| `--headed` | Show browser window (not headless) (or `AGENT_BROWSER_HEADED` env) |
+| `--headed` | Show browser window on the interactive desktop (or `AGENT_BROWSER_HEADED` env) |
 | `--webgpu` | Enable WebGPU; SwiftShader software Vulkan on Linux, no GPU required (or `AGENT_BROWSER_WEBGPU` env) |
 | `--no-webmcp` | Disable experimental WebMCP support, which is enabled by default for locally launched Chrome (or `AGENT_BROWSER_NO_WEBMCP` env) |
 | `--cdp <port\|url>` | Connect via Chrome DevTools Protocol (port or WebSocket URL) |
@@ -1355,6 +1355,8 @@ agent-browser set headers '{"X-Custom-Header": "value"}'
 ```
 
 ## Custom Browser Executable
+
+On Windows, agent-browser launches headless Chrome on a private desktop so hidden browser windows cannot leave visible rectangles on your desktop, including with affected Chrome 150 builds. This also applies to custom executables and windows opened later in the session. Headed browsers, including sessions with extensions, use the interactive desktop. Chrome processes launched by agent-browser belong to a Windows Job Object and are terminated when their daemon exits or is forcibly killed. Browsers connected through `--cdp` or `--auto-connect` remain externally owned.
 
 Use a custom browser executable instead of the bundled Chromium. This is useful for:
 

@@ -124,7 +124,7 @@ agent-browser record start ./soak.webm --fps 10    # Lower rate for long session
 agent-browser tab new https://example.com          # Open a separate tab first if you want the recording there
 ```
 
-`--fps` accepts 1 to 60 and defaults to 30. Playback duration always matches the wall clock time recorded, so a slow page holds frames instead of speeding the video up.
+Needs `ffmpeg` on PATH; use a `.webm` or `.mp4` path (other extensions go to ffmpeg as-is, an extensionless path is rejected). `--fps` accepts 1 to 60 and defaults to 30. Playback duration always matches the wall clock time recorded, so a slow page holds frames instead of speeding the video up.
 
 ## Wait
 
@@ -435,6 +435,8 @@ agent-browser <command> --help        # Show detailed help for a command
 ```
 
 ## Debugging
+
+On Windows, owned headless Chrome runs on a private desktop so hidden windows cannot draw stray rectangles over the user's desktop. This applies to custom Chrome executables and windows created later through CDP. Headed and extension sessions use the interactive desktop. Owned Chrome trees are terminated when their daemon exits, including forced termination; attaching to an external browser does not take ownership of it.
 
 ```bash
 agent-browser --headed open example.com   # Show browser window
