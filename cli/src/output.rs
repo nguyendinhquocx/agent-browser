@@ -1793,7 +1793,8 @@ agent-browser select - Select a dropdown option
 
 Usage: agent-browser select <selector> <value...>
 
-Selects one or more options in a <select> dropdown by value.
+Selects one or more options in a <select> dropdown by value or visible label.
+Label matching normalizes whitespace such as non-breaking spaces.
 
 Global Options:
   --json               Output as JSON
@@ -2049,6 +2050,7 @@ Examples:
   agent-browser wait "#loading-spinner"
   agent-browser wait 2000
   agent-browser wait --url "**/dashboard"
+  # Use networkidle only for pages known to become quiet:
   agent-browser wait --load networkidle
   agent-browser wait --fn "window.appReady === true"
   agent-browser wait --text "Welcome back"
@@ -3693,7 +3695,7 @@ Core Commands:
   focus <sel>                Focus element
   check <sel>                Check checkbox
   uncheck <sel>              Uncheck checkbox
-  select <sel> <val...>      Select dropdown option
+  select <sel> <val...>      Select dropdown by value or visible label
   drag <src> <dst>           Drag and drop
   upload <sel> <files...>    Upload files
   download <sel> <path>      Download file by clicking element
