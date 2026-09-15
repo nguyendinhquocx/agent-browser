@@ -76,6 +76,7 @@ fn native_test_fixture_html(name: &str) -> &'static str {
         "webmcp_delayed_probe" => include_str!("test_fixtures/webmcp_delayed_probe.html"),
         "webmcp_frame_probe" => include_str!("test_fixtures/webmcp_frame_probe.html"),
         "webmcp_probe" => include_str!("test_fixtures/webmcp_probe.html"),
+        "webmcp_context_probe" => include_str!("test_fixtures/webmcp_context_probe.html"),
         _ => panic!("Unknown native test fixture: {}", name),
     }
 }
@@ -456,7 +457,7 @@ async fn e2e_webmcp_discovery_invocation_and_cancellation() {
 
 #[tokio::test]
 #[ignore]
-async fn e2e_webmcp_navigation_waits_for_delayed_initial_registration() {
+async fn e2e_webmcp_delayed_registration_appears_on_next_action() {
     let (fixture_url, fixture_server) = start_webmcp_server().await;
     let mut state = DaemonState::new();
     let resp = execute_command(
@@ -476,13 +477,266 @@ async fn e2e_webmcp_navigation_waits_for_delayed_initial_registration() {
     )
     .await;
     assert_success(&resp);
-    assert_eq!(get_data(&resp)["webmcp"]["experimental"], true);
-    assert_eq!(get_data(&resp)["webmcp"]["available"], true);
-    assert_eq!(get_data(&resp)["webmcp"]["toolCount"], 1);
+    let already_observed = get_data(&resp).get("webmcp").is_some();
+    let resp = execute_command(
+        &json!({"id": "wait", "action": "wait", "timeout": 150}),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    if !already_observed {
+        assert_eq!(get_data(&resp)["webmcp"]["experimental"], true);
+        assert_eq!(get_data(&resp)["webmcp"]["available"], true);
+        assert_eq!(get_data(&resp)["webmcp"]["toolCount"], 1);
+    }
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
     fixture_server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_webmcp_context_follows_actions_without_explicit_discovery() {
+    let (url, server) = start_webmcp_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({"id": "launch", "action": "launch", "headless": true}),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let commands = [
+        (
+            json!({"action": "navigate", "url": format!("{url}/context.html")}),
+            -1,
+        ),
+        (json!({"action": "click", "selector": "#register"}), 1),
+        (json!({"action": "snapshot"}), -1),
+        (json!({"action": "webmcp_list", "tool": "set_message"}), -1),
+        (
+            json!({"action": "fill", "selector": "#description", "value": "Updated description"}),
+            1,
+        ),
+        (
+            json!({"action": "webmcp_invoke", "tool": "set_message", "params": {"message": "Hello from discovered tool"}}),
+            -1,
+        ),
+        (json!({"action": "gettext", "selector": "#result"}), -1),
+        (
+            json!({"action": "evaluate", "script": "history.pushState({}, '', '#route')"}),
+            -1,
+        ),
+        (
+            json!({"action": "tab_new", "url": format!("{url}/empty.html")}),
+            0,
+        ),
+        (json!({"action": "tab_switch", "tabId": "t1"}), 1),
+        (json!({"action": "tab_close", "tabId": "t2"}), -1),
+        (json!({"action": "click", "selector": "#remove"}), 0),
+        (json!({"action": "wait", "timeout": 50}), -1),
+        (json!({"action": "click", "selector": "#register"}), 1),
+        (
+            json!({"action": "navigate", "url": format!("{url}/empty.html")}),
+            0,
+        ),
+    ];
+    for (mut cmd, count) in commands {
+        cmd["id"] = json!("context");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+        let mut context = get_data(&resp)["webmcp"].clone();
+        // Chrome may deliver tool events after the action's reply. Passive
+        // observation reports them on a later ordinary action, without listing
+        // tools or retrying the mutation. Re-registration can also briefly
+        // report removal before the replacement tool is observed.
+        if count >= 0 && context["toolCount"] != count {
+            context = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let update = execute_command(
+                        &json!({"id": "context-update", "action": "wait", "timeout": 50}),
+                        &mut state,
+                    )
+                    .await;
+                    assert_success(&update);
+                    let context = &get_data(&update)["webmcp"];
+                    if context["toolCount"] == count {
+                        break context.clone();
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("Missing WebMCP update after {cmd}: {resp}"));
+        }
+        if count == -1 {
+            assert!(
+                context.is_null(),
+                "Unchanged or empty page must stay quiet: {cmd}: {resp}"
+            );
+        } else {
+            assert_eq!(context["status"], "ready", "{cmd}: {resp}");
+            assert_eq!(context["toolCount"], count, "{cmd}: {resp}");
+            assert_eq!(context["available"], count > 0);
+        }
+        if count > 0 {
+            let tool = &context["tools"][0];
+            assert_eq!(tool["name"], "set_message");
+            assert!(tool.get("inputSchema").is_none());
+            assert!(tool["frameId"].as_str().is_some_and(|id| !id.is_empty()));
+            assert_eq!(tool["origin"], url);
+            if cmd["action"] == "fill" {
+                assert_eq!(tool["description"], "Updated description");
+            }
+        }
+        if cmd["action"] == "webmcp_list" {
+            assert_eq!(get_data(&resp)["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                get_data(&resp)["tools"][0]["inputSchema"]["required"],
+                json!(["message"])
+            );
+        }
+        if cmd["action"] == "gettext" {
+            assert_eq!(get_data(&resp)["text"], "Hello from discovered tool");
+        }
+    }
+    let resp = execute_command(&json!({"id": "close", "action": "close"}), &mut state).await;
+    assert_success(&resp);
+    assert!(get_data(&resp).get("webmcp").is_none());
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_webmcp_same_document_navigation_preserves_catalog_and_invocations() {
+    let (url, server) = start_webmcp_server().await;
+    let mut state = DaemonState::new();
+    for mut cmd in [
+        json!({"action": "launch", "headless": true}),
+        json!({"action": "navigate", "url": url}),
+    ] {
+        cmd["id"] = json!("setup");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+    }
+    let resp = execute_command(
+        &json!({"id": "invoke", "action": "webmcp_invoke", "tool": "wait_for_cancel", "params": {}, "detach": true}),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let invocation_id = get_data(&resp)["invocationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap().to_string();
+    // Stop tool events so this test cannot pass by silently rediscovering the
+    // catalog. Page navigation events remain enabled for document invalidation.
+    browser
+        .client
+        .send_command_no_params("WebMCP.disable", Some(&session))
+        .await
+        .unwrap();
+    let resp = execute_command(&json!({"id": "settle", "action": "title"}), &mut state).await;
+    assert_success(&resp);
+    let tools = state.webmcp.tools(&session).unwrap();
+    assert!(tools.iter().any(|tool| tool.name == "wait_for_cancel"));
+    assert_eq!(state.webmcp.invocations[&invocation_id].status, "pending");
+
+    for mut cmd in [
+        json!({"action": "navigate", "url": format!("{url}/#route")}),
+        json!({"action": "snapshot"}),
+        json!({"action": "navigate", "url": format!("{url}/#next")}),
+        json!({"action": "evaluate", "script": "history.pushState({}, '', '#history')"}),
+        json!({"action": "title"}),
+    ] {
+        cmd["id"] = json!("same-document");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+        assert!(get_data(&resp).get("webmcp").is_none(), "{cmd}: {resp}");
+        assert_eq!(state.webmcp.tools(&session).unwrap(), tools, "{cmd}");
+        assert_eq!(state.webmcp.invocations[&invocation_id].status, "pending");
+    }
+
+    let resp = execute_command(
+        &json!({"id": "new-document", "action": "navigate", "url": format!("{url}/empty.html")}),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["webmcp"]["toolCount"], 0);
+    assert!(state.webmcp.tools(&session).unwrap().is_empty());
+    assert!(state.webmcp.invocations[&invocation_id].to_json()["error"]
+        .as_str()
+        .is_some_and(|error| error.starts_with("webmcp_context_changed:")));
+
+    // New documents still populate the catalog through the existing
+    // subscription and reannounce tools even when the records are identical.
+    state
+        .browser
+        .as_ref()
+        .unwrap()
+        .client
+        .send_command_no_params("WebMCP.enable", Some(&session))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let resp = execute_command(
+            &json!({"id": "reload", "action": "navigate", "url": url}),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert!(get_data(&resp)["webmcp"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "wait_for_cancel"));
+    }
+    let resp = execute_command(&json!({"id": "close", "action": "close"}), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_webmcp_ordinary_page_stays_quiet_without_reprobing() {
+    let (url, server) = start_webmcp_server().await;
+    let mut state = DaemonState::new();
+    for (index, mut cmd) in [
+        json!({"action": "launch", "headless": true}),
+        json!({"action": "navigate", "url": format!("{url}/empty.html")}),
+        json!({"action": "snapshot"}),
+        json!({"action": "title"}),
+        json!({"action": "evaluate", "script": "document.title"}),
+        json!({"action": "wait", "timeout": 1}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        cmd["id"] = json!(index.to_string());
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+        assert!(get_data(&resp).get("webmcp").is_none(), "{cmd}: {resp}");
+    }
+    // Disable browser-side events behind the daemon. If ordinary commands
+    // re-enable discovery, the registration below would incorrectly appear.
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap().to_string();
+    browser
+        .client
+        .send_command_no_params("WebMCP.disable", Some(&session))
+        .await
+        .unwrap();
+    let resp = execute_command(&json!({"id": "register", "action": "evaluate", "script": "document.modelContext.registerTool({name: 'probe', description: 'probe', inputSchema: {type: 'object'}, execute: async () => ({ok: true})}); true"}), &mut state).await;
+    assert_success(&resp);
+    assert!(get_data(&resp).get("webmcp").is_none());
+    assert_eq!(state.webmcp.observations.len(), 1);
+    let resp = execute_command(&json!({"id": "snapshot", "action": "snapshot"}), &mut state).await;
+    assert_success(&resp);
+    assert!(get_data(&resp).get("webmcp").is_none());
+    execute_command(&json!({"id": "close", "action": "close"}), &mut state).await;
+    server.abort();
 }
 
 #[tokio::test]
@@ -1110,6 +1364,118 @@ async fn e2e_snapshot_and_click_ref() {
     assert_success(&resp);
 }
 
+#[tokio::test]
+#[ignore]
+async fn e2e_snapshot_refs_survive_dom_updates_and_never_recycle() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "1", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "2", "action": "navigate", "url": "about:blank" }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "3", "action": "setcontent", "html": "<button id='a'>Alpha</button><button id='b'>Beta</button>" }),
+            &mut state,
+        )
+        .await,
+    );
+
+    let first = execute_command(&json!({ "id": "4", "action": "snapshot" }), &mut state).await;
+    assert_success(&first);
+    let alpha_ref = get_data(&first)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, node)| node["name"] == "Alpha")
+        .map(|(ref_id, _)| ref_id.clone())
+        .unwrap();
+
+    assert_success(
+        &execute_command(
+            &json!({ "id": "5", "action": "evaluate", "script": "document.body.prepend(document.getElementById('a')); document.getElementById('b').remove()" }),
+            &mut state,
+        )
+        .await,
+    );
+    let second = execute_command(&json!({ "id": "6", "action": "snapshot" }), &mut state).await;
+    assert_success(&second);
+    assert_eq!(get_data(&second)["refs"][&alpha_ref]["name"], "Alpha");
+    assert_eq!(
+        get_data(&second)["removedRefs"].as_array().unwrap().len(),
+        1
+    );
+
+    assert_success(
+        &execute_command(
+            &json!({ "id": "7", "action": "navigate", "url": "about:blank?new-document" }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "8", "action": "setcontent", "html": "<button>Alpha</button>" }),
+            &mut state,
+        )
+        .await,
+    );
+    let third = execute_command(&json!({ "id": "9", "action": "snapshot" }), &mut state).await;
+    assert_success(&third);
+    assert!(get_data(&third)["refs"].get(&alpha_ref).is_none());
+    assert_success(&execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_snapshot_refs_invalidate_iframe_navigation() {
+    let mut state = DaemonState::new();
+    for command in [
+        json!({"action": "launch", "headless": true}),
+        json!({"action": "navigate", "url": "about:blank"}),
+        json!({"action": "setcontent", "html": "<button>Parent</button><iframe id='child'></iframe>"}),
+    ] {
+        assert_success(&execute_command(&command, &mut state).await);
+    }
+    let replace = json!({"action": "evaluate", "script": "new Promise(resolve => { const f = document.getElementById('child'); f.onload = () => resolve(true); f.srcdoc = '<button>Child</button>'; })"});
+    assert_success(&execute_command(&replace, &mut state).await);
+    let first = execute_command(&json!({"action": "snapshot"}), &mut state).await;
+    assert_success(&first);
+    let find_ref = |snapshot: &Value, name: &str| {
+        get_data(snapshot)["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, node)| node["name"] == name)
+            .unwrap()
+            .0
+            .clone()
+    };
+    let parent = find_ref(&first, "Parent");
+    let child = find_ref(&first, "Child");
+    let unchanged = execute_command(&json!({"action": "snapshot"}), &mut state).await;
+    assert_eq!(find_ref(&unchanged, "Child"), child);
+    assert_success(&execute_command(&replace, &mut state).await);
+    let replaced = execute_command(&json!({"action": "snapshot"}), &mut state).await;
+    assert_success(&replaced);
+    assert_eq!(find_ref(&replaced, "Parent"), parent);
+    assert_ne!(find_ref(&replaced, "Child"), child);
+    assert!(get_data(&replaced)["removedRefs"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(format!("@{child}"))));
+    assert_success(&execute_command(&json!({"action": "close"}), &mut state).await);
+}
+
 // ---------------------------------------------------------------------------
 // Screenshot
 // ---------------------------------------------------------------------------
@@ -1159,6 +1525,28 @@ async fn e2e_screenshot() {
     let _ = std::fs::remove_file(&tmp_path);
 
     let resp = execute_command(
+        &json!({ "id": "4a", "action": "screenshot", "ifChanged": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["changed"], true);
+    assert_eq!(get_data(&resp)["revision"], 1);
+    let conditional_path = get_data(&resp)["path"].as_str().unwrap().to_string();
+
+    let resp = execute_command(
+        &json!({ "id": "4b", "action": "screenshot", "ifChanged": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["changed"], false);
+    assert_eq!(get_data(&resp)["revision"], 2);
+    assert_eq!(get_data(&resp)["pixelChangeRatio"], 0.0);
+    assert!(get_data(&resp).get("path").is_none());
+    let _ = std::fs::remove_file(conditional_path);
+
+    let resp = execute_command(
         &json!({
             "id": "5",
             "action": "setcontent",
@@ -1174,6 +1562,17 @@ async fn e2e_screenshot() {
     )
     .await;
     assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "5a", "action": "screenshot", "ifChanged": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["changed"], true);
+    assert_eq!(get_data(&resp)["revision"], 3);
+    assert!(get_data(&resp)["pixelChangeRatio"].as_f64().unwrap() > 0.0);
+    let _ = std::fs::remove_file(get_data(&resp)["path"].as_str().unwrap());
 
     let resp = execute_command(
         &json!({ "id": "6", "action": "screenshot", "annotate": true }),
@@ -4149,7 +4548,7 @@ async fn e2e_diff_snapshot() {
     .await;
     assert_success(&resp);
 
-    // Repeated diffs must each begin a fresh ref-numbering epoch.
+    // Repeated diffs preserve document refs and report no content changes.
     for id in ["6", "7"] {
         let resp = execute_command(
             &json!({ "id": id, "action": "diff_snapshot", "baseline": baseline_path }),
@@ -4283,11 +4682,34 @@ async fn e2e_diff_url_aligns_refs_after_snapshot() {
     assert_eq!(data["diff"]["changed"], false);
     assert_eq!(data["diff"]["additions"], 0);
     assert_eq!(data["diff"]["removals"], 0);
-    assert_eq!(data["snapshot1"], data["snapshot2"]);
-    assert!(data["snapshot1"]
-        .as_str()
+    assert_ne!(
+        data["snapshot1"], data["snapshot2"],
+        "Replaced documents must not recycle actionable IDs"
+    );
+    assert_eq!(
+        super::diff::snapshot_comparison_text(data["snapshot1"].as_str().unwrap()),
+        super::diff::snapshot_comparison_text(data["snapshot2"].as_str().unwrap())
+    );
+    let primary_ref = state
+        .ref_map
+        .entries_sorted()
+        .into_iter()
+        .find(|(_, entry)| entry.name == "Primary action")
         .unwrap()
-        .starts_with("- button \"Primary action\" [ref=e1]"));
+        .0;
+    let next = execute_command(&json!({"id": "9", "action": "snapshot"}), &mut state).await;
+    assert_success(&next);
+    assert_eq!(
+        get_data(&next)["refs"][&primary_ref]["name"],
+        "Primary action"
+    );
+    assert_success(
+        &execute_command(
+            &json!({"id": "10", "action": "click", "selector": primary_ref}),
+            &mut state,
+        )
+        .await,
+    );
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
@@ -5398,6 +5820,10 @@ async fn start_webmcp_server() -> (String, tokio::task::JoinHandle<()>) {
                 let body = if request.starts_with("GET /frame.html ") {
                     native_test_fixture_html("webmcp_frame_probe")
                         .replace("__PORT__", &port.to_string())
+                } else if request.starts_with("GET /context.html ") {
+                    native_test_fixture_html("webmcp_context_probe").to_string()
+                } else if request.starts_with("GET /empty.html ") {
+                    "<!doctype html><title>No page tools</title>".to_string()
                 } else if request.starts_with("GET /delayed.html ") {
                     native_test_fixture_html("webmcp_delayed_probe").to_string()
                 } else {
@@ -8096,10 +8522,8 @@ async fn e2e_recording_default_with_url_navigates_active_tab() {
 // Recording: requested frame rate
 // ---------------------------------------------------------------------------
 
-/// Verify that `recording_start` honors an explicit frame rate and that the
-/// frame count tracks wall clock. Screencast frames arrive only when the page
-/// repaints, and the ticker holds the last frame through gaps, so roughly
-/// `fps * seconds` frames must reach ffmpeg even for a static page.
+/// Verify that a requested frame rate sets the timestamp resolution without
+/// filling a static recording with duplicate encoded frames.
 #[tokio::test]
 #[ignore]
 async fn e2e_recording_honors_requested_fps() {
@@ -8156,21 +8580,40 @@ async fn e2e_recording_honors_requested_fps() {
     assert_eq!(data["fps"].as_u64(), Some(FPS));
 
     let frames = data["frames"].as_u64().unwrap();
-    let expected = FPS * RECORD_MS / 1000;
     assert!(
-        frames >= expected / 2 && frames <= expected * 2,
-        "expected roughly {expected} frames at {FPS} fps over {RECORD_MS}ms, got {frames}"
+        (FPS * 8 / 10..FPS * 15 / 10).contains(&frames),
+        "static page should repeat frames at {FPS} fps, got {frames}"
     );
-    // A static page repaints once, so the file is one captured frame held
-    // for the whole take.
     let captured = data["capturedFrames"].as_u64().unwrap();
-    assert!(
-        (1..frames).contains(&captured),
-        "static page should yield a few captured frames held across {frames} written, got {captured}"
-    );
+    assert!(captured >= 1, "static page should produce an initial frame");
 
     let size = std::fs::metadata(&rec_path).map(|m| m.len()).unwrap_or(0);
     assert!(size > 0, "recording file should not be empty");
+    let probe = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(&rec_path)
+        .output()
+        .expect("ffprobe should inspect the recording");
+    assert!(probe.status.success());
+    let duration: f64 = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .parse()
+        .expect("ffprobe duration should be numeric");
+    assert!(
+        (0.8..1.5).contains(&duration),
+        "recording should retain wall-clock duration, got {duration}"
+    );
+    assert!(
+        (duration - frames as f64 / FPS as f64).abs() < 0.03,
+        "{frames} frames at {FPS} fps should match duration {duration}"
+    );
 
     let _ = std::fs::remove_file(&rec_path);
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
@@ -8361,6 +8804,170 @@ async fn e2e_recording_rejects_invalid_fps() {
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
+}
+
+/// Verify the composited pointer and changed-frame contact sheet through the
+/// full daemon pipeline.
+#[tokio::test]
+#[ignore]
+async fn e2e_recording_cursor_and_contact_sheet() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = r#"data:text/html,<style>body{margin:0;background:%23f3f4f6;font-family:sans-serif}.card{margin:80px;padding:48px;background:white;border-radius:24px}button{padding:18px 28px;background:%232563eb;color:white;border:0;border-radius:12px}</style><div class=card><h1>Contact sheet demo</h1><p>Review important visual changes at a glance.</p><button>Continue</button></div>"#;
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let rec_path = std::env::temp_dir().join(format!(
+        "ab-e2e-rec-contact-sheet-{}.webm",
+        std::process::id()
+    ));
+    let sheet_path = rec_path.with_file_name(format!(
+        "{}.contact-sheet.png",
+        rec_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "recording_start",
+            "path": rec_path.to_string_lossy(),
+            "cursor": true,
+            "contactSheet": true,
+            "contactSheetThreshold": 0.01
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["cursor"], true);
+    assert_eq!(get_data(&resp)["contactSheet"], true);
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "evaluate", "script": "Boolean(document.getElementById('__agent_browser_recording_cursor__'))" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], false);
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "mousemove", "x": 360, "y": 260 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let cursor = state
+        .recording_state
+        .shared_cursor
+        .lock()
+        .unwrap()
+        .at(super::recording::cursor_timestamp());
+    assert!(cursor.visible);
+    assert_eq!((cursor.x, cursor.y), (360.0, 260.0));
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "evaluate", "script": "document.querySelector('.card').style.background='#dbeafe'; document.querySelector('h1').textContent='Ready to continue'; true" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "evaluate", "script": "document.querySelector('.card').style.background='#dcfce7'; document.querySelector('p').textContent='The important region is highlighted.'; true" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "recording_stop" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(
+        data["contactSheetPath"],
+        sheet_path.to_string_lossy().as_ref()
+    );
+    assert!(data["contactSheetFrames"].as_u64().unwrap_or(0) >= 2);
+    assert!(std::fs::metadata(&rec_path).unwrap().len() > 0);
+    let sheet = image::open(&sheet_path).expect("contact sheet should be a valid PNG");
+    assert!(sheet.width() >= 320);
+    assert!(sheet.height() >= 150);
+    if let Some(example_path) = std::env::var_os("AGENT_BROWSER_CONTACT_SHEET_EXAMPLE_PATH") {
+        let example_path = std::path::PathBuf::from(example_path);
+        if let Some(parent) = example_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::copy(&sheet_path, example_path).unwrap();
+    }
+
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "evaluate", "script": "Boolean(document.getElementById('__agent_browser_recording_cursor__'))" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], false);
+
+    let _ = std::fs::remove_file(&rec_path);
+    let _ = std::fs::remove_file(&sheet_path);
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_initial_recording_frame_uses_css_viewport_dimensions() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({
+                "action": "viewport",
+                "width": 400,
+                "height": 300,
+                "deviceScaleFactor": 2.0
+            }),
+            &mut state,
+        )
+        .await,
+    );
+
+    let browser = state.browser.as_ref().unwrap();
+    let initial = super::recording::capture_initial_image(
+        &browser.client,
+        browser.active_session_id().unwrap(),
+    )
+    .await
+    .unwrap();
+    let (pixel_width, pixel_height) = image::ImageReader::with_format(
+        std::io::Cursor::new(&initial.image_data),
+        image::ImageFormat::Png,
+    )
+    .into_dimensions()
+    .unwrap();
+
+    assert_eq!((pixel_width, pixel_height), (800, 600));
+    assert_eq!(
+        (initial.device_width, initial.device_height),
+        (400.0, 300.0)
+    );
+
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
 }
 
 // ---------------------------------------------------------------------------
@@ -10313,6 +10920,73 @@ async fn start_a11y_frame_server() -> (u16, tokio::task::JoinHandle<()>) {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_recording_cursor_uses_page_coordinates_for_oopif() {
+    let (port, server) = start_a11y_frame_server().await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({"action": "launch", "headless": true}), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({"action": "navigate", "url": format!("http://localhost:{port}/top")}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&execute_command(&json!({"action": "evaluate", "script": "document.getElementById('outer').style.cssText = 'position:absolute;left:240px;top:160px;width:400px;height:300px;border:10px solid black'"}), &mut state).await);
+    let child_session = state
+        .iframe_sessions
+        .values()
+        .next()
+        .expect("fixture must use an OOPIF")
+        .clone();
+    state.browser.as_ref().unwrap().client.send_command("Runtime.evaluate", Some(json!({
+        "expression": "document.body.innerHTML = '<button style=\"position:absolute;left:20px;top:30px;width:80px;height:40px\">Cursor target</button>'"
+    })), Some(&child_session)).await.unwrap();
+    let snapshot = execute_command(&json!({"action": "snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let reference = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Cursor target")
+        .unwrap()
+        .0
+        .clone();
+    // Initialize cursor history without an encoder; the test inspects the exact
+    // samples consumed by both video and contact-sheet compositing.
+    super::recording::recording_start(
+        &mut state.recording_state,
+        "unused.webm",
+        super::recording::RecordingOptions {
+            cursor: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for action in ["hover", "click", "dblclick"] {
+        assert_success(&execute_command(&json!({"action": action, "selector": format!("@{reference}"), "inputMode": "human"}), &mut state).await);
+        let cursor = state
+            .recording_state
+            .shared_cursor
+            .lock()
+            .unwrap()
+            .at(f64::INFINITY);
+        assert!(cursor.visible);
+        assert!(
+            (cursor.x - 310.0).abs() < 1.0 && (cursor.y - 220.0).abs() < 1.0,
+            "{action}: cursor should be at page (310, 220), got {cursor:?}"
+        );
+        assert!((state.mouse_state.x - cursor.x).abs() < 1.0);
+        assert!((state.mouse_state.y - cursor.y).abs() < 1.0);
+    }
+    state.recording_state.active = false;
+    assert_success(&execute_command(&json!({"action": "close"}), &mut state).await);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_a11y_uses_vendored_engine_and_preserves_shadow_targets() {
     let mut state = DaemonState::new();
 
@@ -11405,4 +12079,47 @@ async fn e2e_find_role_document_matches_root() {
     assert_success(&resp);
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_mouse_interpolation_starts_at_last_element_interaction() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({"id": "1", "action": "launch", "headless": true}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&execute_command(&json!({"id": "2", "action": "setcontent", "html": "<button id='b' style='position:absolute;left:400px;top:300px;width:100px;height:40px'>Target</button><input id='c' type='checkbox' style='position:absolute;left:200px;top:200px'>"}), &mut state).await);
+    for action in ["click", "hover", "dblclick", "check", "uncheck"] {
+        let selector = if matches!(action, "check" | "uncheck") {
+            "#c"
+        } else {
+            "#b"
+        };
+        assert_success(
+            &execute_command(
+                &json!({"id": "3", "action": action, "selector": selector}),
+                &mut state,
+            )
+            .await,
+        );
+        let start = (state.mouse_state.x, state.mouse_state.y);
+        assert!(start.0 >= 200.0 && start.1 >= 200.0, "{action}: {start:?}");
+        assert_success(&execute_command(&json!({"id": "4", "action": "evaluate", "script": "window.moves=[];document.onmousemove=e=>moves.push([e.clientX,e.clientY]);"}), &mut state).await);
+        assert_success(&execute_command(&json!({"id": "5", "action": "mousemove", "x": start.0 + 100.0, "y": start.1, "steps": 2}), &mut state).await);
+        let result = execute_command(
+            &json!({"id": "6", "action": "evaluate", "script": "moves"}),
+            &mut state,
+        )
+        .await;
+        assert_success(&result);
+        let moves = get_data(&result)["result"].as_array().unwrap();
+        assert_eq!(moves.len(), 2, "{action}: {moves:?}");
+        assert!((moves[0][0].as_f64().unwrap() - (start.0 + 50.0)).abs() <= 1.0);
+        assert!((moves[1][0].as_f64().unwrap() - (start.0 + 100.0)).abs() <= 1.0);
+    }
+    assert_success(&execute_command(&json!({"id": "99", "action": "close"}), &mut state).await);
 }
