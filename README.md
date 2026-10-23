@@ -620,7 +620,7 @@ Common tools include:
 - `agent_browser_eval`
 - `agent_browser_close`
 
-Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, and `allowedDomains`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
+Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, and `allowedDomains`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Each tool also accepts `extraArgs` for per-command options and display or emulation flags such as `--engine`, but global flags that change network, file, policy, or host access (such as `--allowed-domains`, `--action-policy`, `--executable-path`, `--args`, and `--config`) are rejected and must be set in the MCP server's environment or config. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
 
 Example MCP client config:
 
@@ -901,11 +901,11 @@ agent-browser plugin add @company/agent-browser-plugin-vault --name vault
 agent-browser plugin add org/agent-browser-plugin-cloud-browser
 ```
 
-References are resolved by shape: `name` uses npm, `@scope/name` uses npm, and `owner/repo` uses GitHub. `plugin add` writes `./agent-browser.json` by default; use `--global` for `~/.agent-browser/config.json`.
+References are resolved by shape: `name` uses npm, `@scope/name` uses npm, and `owner/repo` uses GitHub. `plugin add` writes `~/.agent-browser/config.json` by default; use `--project` for `./agent-browser.json` (only used with `--config`).
 
 Plugin packages should support `plugin.manifest` so `plugin add` can discover their name and capabilities automatically. If a plugin does not support manifests, pass `--capability <name>` during add.
 
-Plugins can also be configured manually in `agent-browser.json`:
+Plugins can also be configured manually in `~/.agent-browser/config.json` (or a file loaded with `--config`):
 
 ```json
 {
@@ -1159,7 +1159,7 @@ agent-browser --model openai/gpt-4o chat "take a screenshot" # Override model
 
 The `chat` command translates natural language instructions into agent-browser commands, executes them, and streams the AI response. In interactive mode, type `quit` to exit. Use `--json` for structured output suitable for agent consumption.
 
-Chat runs one agent-browser command per tool call. A `;` or `&&` inside a quoted argument is kept as text, so JSON parameters can contain them. Chat can load bundled skills with `skills get <name>` and use page WebMCP tools: it fetches a tool's input schema with `webmcp list <tool> --frame <frame-id> --json`, then calls `webmcp invoke` with the same `--frame`.
+Chat runs one agent-browser command per tool call. A `;` or `&&` inside a quoted argument is kept as text, so JSON parameters can contain them. Chat can load bundled skills with `skills get <name>` and use page WebMCP tools: it fetches a tool's input schema with `webmcp list <tool> --frame <frame-id> --json`, then calls `webmcp invoke` with the same `--frame`. Chat runs in the selected session and cannot create or switch sessions; use New Session in the dashboard for a new one. Chat commands cannot set global flags other than `--json` and `--annotate`.
 
 **Dashboard usage:**
 
@@ -1176,7 +1176,9 @@ Create an `agent-browser.json` file to set persistent defaults instead of repeat
 3. `AGENT_BROWSER_*` environment variables override config file values
 4. CLI flags override everything
 
-**Example `agent-browser.json`:**
+The auto-discovered `./agent-browser.json` cannot set `executablePath`, `args` or `plugins` (they are ignored with a warning); set them in `~/.agent-browser/config.json`, env vars or flags, or load the file explicitly with `--config ./agent-browser.json`.
+
+**Example config file:**
 
 ```json
 {
@@ -1539,6 +1541,8 @@ agent-browser --cdp "wss://your-browser-service.com/cdp?token=..." snapshot
 ```
 
 The session stays attached until `agent-browser close`. Later commands without a connection flag run against the same browser, as if you passed `--cdp` again. If that browser goes away, commands fail instead of launching a local one.
+
+If the debugging port is not open yet, `connect` and `--cdp` wait up to 2 seconds for it before failing.
 
 The `--cdp` flag accepts either:
 
