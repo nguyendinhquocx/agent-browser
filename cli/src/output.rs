@@ -996,6 +996,7 @@ fn print_primary_response(resp: &Response, action: Option<&str>, opts: &OutputOp
                 let label = match action {
                     Some("cookies_clear") => "Cookies cleared",
                     Some("console") => "Console log cleared",
+                    Some("errors") => "Page errors cleared",
                     _ => "Request log cleared",
                 };
                 println!("{} {}", color::success_indicator(), label);
@@ -3651,12 +3652,19 @@ Examples:
 agent-browser mcp - Start an MCP stdio server
 
 Usage: agent-browser mcp [--tools <profiles>]
+       agent-browser mcp call <tool> [<arguments-json> | -] [--tools <profiles>]
 
 Starts a Model Context Protocol server over stdio. MCP clients launch this
 command as a subprocess and communicate with newline-delimited JSON-RPC.
 stdout is reserved for MCP protocol messages; logs and diagnostics use stderr.
 The server defaults to MCP protocol 2025-11-25 and accepts older supported
 client protocol versions during initialization.
+
+mcp call runs one tool without a stdio session and prints its tools/call
+result as JSON, with the agent-browser version in _meta.agentBrowserVersion.
+Pass the arguments as a JSON object, or - to read them from stdin. Every tool
+is available unless --tools limits the call. Exit code: 0 on success, 1 when
+the tool reports an error, 2 for an unknown tool or invalid arguments.
 
 The default tools profile is core, which keeps MCP context small for everyday
 browser automation. Use --tools all for the full typed CLI parity surface, or
@@ -4110,6 +4118,7 @@ Options:
   --confirm-interactive      Interactive confirmation prompts; auto-denies if stdin is not a TTY (or AGENT_BROWSER_CONFIRM_INTERACTIVE)
   --idle-timeout <time>      Shut down daemon after inactivity: 10s, 3m, 1h, or raw ms
                              (default: 1h; 0 disables; dashboard input resets the timer)
+                             Values too large to convert to milliseconds produce a warning and are ignored
   --engine <name>            Browser engine: chrome (default), lightpanda, obscura (experimental)
                              (or AGENT_BROWSER_ENGINE); Obscura rejects --proxy-bypass,
                              proxyBypass config, AGENT_BROWSER_PROXY_BYPASS, NO_PROXY/no_proxy,
