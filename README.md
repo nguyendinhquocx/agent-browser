@@ -70,6 +70,8 @@ agent-browser install --with-deps
 
 This exits nonzero if the package manager cannot install every required browser library.
 
+When run as root, this command calls the detected package manager directly. For non-root users, it uses `sudo`. If you are not root and `sudo` is unavailable, it reports that root privileges or `sudo` are required.
+
 ### Updating
 
 Upgrade to the latest version:
@@ -83,6 +85,7 @@ Detects your installation method (npm, Homebrew, or Cargo) and runs the appropri
 ### Requirements
 
 - **Chrome** - Run `agent-browser install` to download Chrome from [Chrome for Testing](https://developer.chrome.com/blog/chrome-for-testing/) (Google's official automation channel). Existing Chrome, Brave, Playwright, and Puppeteer installations are detected automatically. No Playwright or Node.js required for the daemon.
+- **macOS browser installation** - On macOS versions below 13, `agent-browser install` stops before downloading Chrome for Testing and prints instructions to update macOS or install Chrome manually. Use Software Update if your Mac supports macOS 13 or later, or install Chrome manually from [Google's Chrome download page](https://www.google.com/chrome/). This check applies when you run `agent-browser install`; the package installation commands above remain unchanged. If `sw_vers -productVersion` is unavailable, exits with an error, returns no version, or returns a malformed version, `agent-browser install` reports a detection error and stops before making a network request.
 - **Node.js 24+ and pnpm 11+** - Only needed when building from source.
 - **Rust** - Only needed when building from source (see From Source above).
 
@@ -157,6 +160,8 @@ agent-browser chat "<instruction>"    # AI chat: natural language browser contro
 agent-browser chat                    # AI chat: interactive REPL mode
 ```
 
+When the top-level Chrome/CDP `eval` result is a value JSON cannot represent, plain output prints its exact JavaScript token, including `NaN`, `Infinity`, `-Infinity`, `-0`, BigInt literals, and `undefined`. With `--json`, `data.result` stays `null` and sibling `data.unserializable` contains the token. MCP text prints the token, and structured responses expose it at `structuredContent.response.data.unserializable`.
+
 ### WebMCP (experimental)
 
 WebMCP is enabled by default in agent-browser-managed Chrome. Use `--no-webmcp` to disable the launch features and proactive context.
@@ -197,11 +202,13 @@ agent-browser get value <sel>         # Get input value
 agent-browser get attr <sel> <attr>   # Get attribute
 agent-browser get title               # Get page title
 agent-browser get url                 # Get current URL
-agent-browser get cdp-url             # Get CDP WebSocket URL (for DevTools, debugging)
+agent-browser get cdp-url             # CDP WebSocket URL of a running browser (never launches)
 agent-browser get count <sel>         # Count matching elements
 agent-browser get box <sel>           # Get bounding box
 agent-browser get styles <sel>        # Get computed styles
 ```
+
+A batch containing only `get cdp-url` commands also skips browser launch. A mixed batch can launch a browser for its other commands.
 
 ### Read Agent-Friendly Text
 
@@ -279,6 +286,10 @@ agent-browser wait "#spinner" --state hidden
 
 **Load states:** `load`, `domcontentloaded`, `networkidle`
 
+For selector waits, `--state` accepts `visible`, `hidden`, `attached`, or `detached` and cannot be combined with URL, load, function, text, download, or millisecond wait modes. The global auth-state `--state <path>` remains available before `wait`, as it does before other commands.
+
+A load-state wait runs for its whole timeout budget, taken from `--timeout` or `AGENT_BROWSER_DEFAULT_TIMEOUT`, and returns an error when it expires.
+
 After a page change, prefer a selector, text, URL, or JavaScript condition that represents the state you need. Use `load` or `domcontentloaded` when the lifecycle event is the milestone. `networkidle` is supported for pages known to become quiet, but SSE, WebSockets, polling, and long-polling can keep it from resolving.
 
 ### Batch Execution
@@ -322,7 +333,14 @@ agent-browser mouse move 600 400 --duration 250 --steps 24 # Smooth movement
 agent-browser mouse move 600 400 --human --seed 42 # Reproducible curved movement
 agent-browser mouse down [button]     # Press button (left/right/middle)
 agent-browser mouse up [button]       # Release button
-agent-browser mouse wheel <dy> [dx]   # Scroll wheel
+agent-browser mouse wheel <dy> [dx]   # Scroll at current tracked pointer (starts at 0,0)
+```
+
+Failed wheel dispatches leave the tracked pointer unchanged. To scroll elsewhere, move the pointer first:
+
+```bash
+agent-browser mouse move 600 400
+agent-browser mouse wheel 100
 ```
 
 Add `--human` to `click` or `drag` for curved, eased movement from the current cursor position. For timed mouse moves, `--duration` is the target total duration, including browser response time; a slow browser can still extend it.
@@ -338,6 +356,8 @@ agent-browser set headers <json>      # Extra HTTP headers
 agent-browser set credentials <u> <p> # HTTP basic auth for current and future tabs
 agent-browser set media [dark|light]  # Emulate color scheme
 ```
+
+Viewport scales and geolocation coordinates must be finite numbers.
 
 `set credentials` applies HTTP Basic Authentication to the current tab and tabs opened later. `set offline off` and `set headers '{}'` restore the default setup for future tabs.
 
@@ -357,6 +377,8 @@ agent-browser storage local clear     # Clear all
 
 agent-browser storage session         # Same for sessionStorage
 ```
+
+Reads accept at most one key, sets require one key and one value, and clears take no operands. A bare key is shorthand for a one-key read.
 
 Cookie attributes use kebab-case flags such as `--http-only` and `--same-site`. The legacy `--httpOnly` and `--sameSite` spellings remain accepted. When setting one cookie, unknown flags and extra arguments return an error.
 
@@ -384,6 +406,8 @@ agent-browser network har start --content none # Metadata only, no bodies
 agent-browser network har stop [output.har]    # Stop and save HAR (temp path if omitted)
 ```
 
+If HAR export fails, recording and captured requests remain available. Fix the destination and retry `network har stop`.
+
 ### Tabs & Windows
 
 ```bash
@@ -398,6 +422,8 @@ agent-browser window new                       # New window
 Tab ids are stable strings of the form `t1`, `t2`, `t3`. They're never reused within a session, so scripts and agents can keep referring to the same tab even after other tabs are opened or closed. Positional integers like `tab 2` are **not** accepted; the `t` prefix disambiguates handles from indices and mirrors the `@e1` convention used for element refs.
 
 You can also assign a memorable label (`docs`, `app`, `admin`) and use it interchangeably with the id. Labels are never auto-generated and never rewritten on navigation — they're yours to name and keep:
+
+A label starts with a letter and contains only letters, digits, `-`, or `_`. Labels must be unique within a session and cannot use the reserved `t<N>` or `T<N>` tab-id form. Rejected labels preserve the current tab's refs and selected frame.
 
 ```bash
 agent-browser tab new --label docs https://docs.example.com
@@ -497,21 +523,21 @@ Some flows (SSR debug, auth cookies for protected origins, init scripts) need st
 
 ```bash
 agent-browser batch \
-  '["open"]' \
-  '["network","route","*","--abort","--resource-type","script"]' \
-  '["cookies","set","--curl","cookies.curl","--domain","localhost"]' \
-  '["navigate","http://localhost:3000/target"]'
+  "open" \
+  "network route * --abort --resource-type script" \
+  "cookies set --curl cookies.curl --domain localhost" \
+  "navigate http://localhost:3000/target"
 ```
 
 Without `batch` the same sequence is three commands that all reuse the same daemon (fast, but not one turn).
 
 ### React / Web Vitals
 
-Agent-browser ships with first-class React introspection and universal Web Vitals metrics. The React commands need the React DevTools hook installed at launch; Web Vitals and pushstate are framework-agnostic.
+Agent-browser ships with first-class React introspection and universal Web Vitals metrics. React commands require the React DevTools hook, installed at launch with `--enable react-devtools`. The binary includes the hook's `installHook.js`; without the hook, React commands error with `React DevTools hook not installed` and tell you to relaunch with `--enable react-devtools`. Web Vitals and pushstate are framework-agnostic.
 
 ```bash
 agent-browser open --enable react-devtools <url>   # Launch with React hook installed
-agent-browser react tree                           # Full component tree
+agent-browser react tree                           # Print the component tree
 agent-browser react inspect <fiberId>              # props, hooks, state, source
 agent-browser react renders start                  # Begin fiber render recording
 agent-browser react renders stop [--json]          # Stop and print profile (--json for raw data)
@@ -520,8 +546,7 @@ agent-browser react suspense [--only-dynamic] [--json]  # Suspense boundaries + 
 agent-browser vitals [url] [--json]                # LCP/CLS/TTFB/FCP/INP + hydration summary
 ```
 
-Each `react ...` subcommand requires `--enable react-devtools` to have been passed at launch (the React DevTools `installHook.js` is embedded in the binary). Without it the commands error with `React DevTools hook not installed
-- relaunch with --enable react-devtools`.
+`react tree` prints the component tree when the output includes one. A header-only result means no component tree was collected; confirm the page uses React and that a React root has mounted.
 
 Works on any React app — Next.js, Remix, Vite+React, CRA, TanStack Start, React Native Web, etc. `vitals` and `pushstate` are framework-agnostic. `vitals` prints a summary by default; pass `--json` for the full structured payload.
 
@@ -597,6 +622,8 @@ agent-browser skills path [name]      # Print skill directory path
 
 Serves bundled skill content that always matches the installed CLI version. AI agents use this to get current instructions rather than relying on cached copies. Set `AGENT_BROWSER_SKILLS_DIR` to override the skills directory path.
 
+When no package root is found, the CLI reads manually installed skills from `~/.agent-browser/skills` and `~/.agent-browser/skill-data`. Package discovery looks for the bundled `skill-data/core/SKILL.md` file.
+
 ### MCP Server
 
 ```bash
@@ -669,7 +696,7 @@ Full parity MCP client config:
 }
 ```
 
-By default, tool invocations use the same config discovery and environment variables as the CLI. Pass `--config <trusted-path>` to `agent-browser mcp` or `agent-browser mcp call` to select one trusted config file; MCP tool child processes load only that file, replacing default user/project discovery. Put any required safety policy in the selected file. Environment variables and accepted per-tool CLI arguments keep their normal precedence. Use `session` in the tool arguments, or set `AGENT_BROWSER_SESSION`, to isolate browser state.
+By default, tool invocations use the same config discovery and environment variables as the CLI, including proxy settings. Pass `--config <trusted-path>` to `agent-browser mcp` or `agent-browser mcp call` to select one trusted config file; MCP tool child processes load only that file, replacing default user/project discovery. Put any required safety policy in the selected file. Environment variables and accepted per-tool CLI arguments keep their normal precedence. Use `session` in the tool arguments, or set `AGENT_BROWSER_SESSION`, to isolate browser state.
 
 ## Authentication
 
@@ -768,6 +795,8 @@ agent-browser session id --scope worktree --prefix next-dev-loop
 # Inspect daemon, launch, and restore status
 agent-browser session info --json
 ```
+
+Session names accept Unicode letters and numbers, hyphens, and underscores only. For example, `café-東京_7` is valid, while `my session` is rejected because it contains a space.
 
 Each session has its own:
 
@@ -1005,9 +1034,11 @@ Do not put vault tokens or passwords in plugin command args. Use the vault vendo
 
 ## Snapshot Options
 
-Surviving DOM elements keep their refs across snapshots. Take a fresh snapshot after page or iframe navigation.
+Surviving DOM elements keep their refs across snapshots. Take a fresh snapshot after page or iframe navigation. Presentational iframes use the same `Iframe` role for snapshots and stale-ref recovery.
 
 Use filters to reduce snapshot output:
+
+Compact snapshots (`-c`) keep visible text, status text, and their direct ancestors. Empty sibling branches are removed. Interactive snapshots (`-i`) filter out noninteractive content. For MCP snapshots, `interactive` defaults to `true`; set `interactive: false` to retain visible text and status text.
 
 ```bash
 agent-browser snapshot                    # Full accessibility tree
@@ -1077,7 +1108,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--enable <feature>` | Built-in init scripts: `react-devtools` (repeatable or comma-list; or `AGENT_BROWSER_ENABLE` env) |
 | `--args <args>` | Browser launch args, newline separated, or comma separated before another flag. Commas inside a value such as `--disable-features=A,B` are kept (or `AGENT_BROWSER_ARGS` env) |
 | `--user-agent <ua>` | Custom User-Agent string (or `AGENT_BROWSER_USER_AGENT` env) |
-| `--proxy <url>` | Proxy server URL with optional auth (or `AGENT_BROWSER_PROXY` env) |
+| `--proxy <url>` | Proxy server URL with optional auth. When launching Chrome, agent-browser accepts a proxy URL with a trailing slash (or `AGENT_BROWSER_PROXY` env) |
 | `--proxy-bypass <hosts>` | Hosts to bypass proxy (or `AGENT_BROWSER_PROXY_BYPASS` env) |
 | `--ignore-https-errors` | Ignore HTTPS certificate errors (useful for self-signed certs) |
 | `--ca-cert <path>` | Trust a CA certificate or PEM bundle for the CLI's own HTTPS requests on every platform, and for locally launched Chromium on Linux; later commands in the same running session retain it when omitted (or `AGENT_BROWSER_CA_CERT` env) |

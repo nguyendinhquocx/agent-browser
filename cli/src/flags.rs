@@ -474,6 +474,7 @@ pub struct Flags {
     pub headed: bool,
     pub debug: bool,
     pub session: String,
+    pub session_source: &'static str,
     pub restore: Option<String>,
     pub restore_save: Option<String>,
     pub restore_check_url: Option<String>,
@@ -566,10 +567,15 @@ pub struct Flags {
 }
 
 pub fn parse_flags(args: &[String]) -> Flags {
-    let config = load_config(args).unwrap_or_else(|e| {
+    try_parse_flags(args).unwrap_or_else(|e| {
         eprintln!("{} {}", color::warning_indicator(), e);
         std::process::exit(1);
-    });
+    })
+}
+
+/// Parse flags and return errors when the selected config cannot be loaded.
+pub fn try_parse_flags(args: &[String]) -> Result<Flags, String> {
+    let config = load_config(args)?;
 
     let extensions_env = env::var("AGENT_BROWSER_EXTENSIONS")
         .ok()
@@ -643,14 +649,22 @@ pub fn parse_flags(args: &[String]) -> Flags {
         env_var_bool("AGENT_BROWSER_CLEAR_CA_CERT"),
     );
 
+    let session_env = env::var("AGENT_BROWSER_SESSION").ok();
+    let session_source = if session_env.is_some() {
+        "AGENT_BROWSER_SESSION"
+    } else if config.session.is_some() {
+        "config session"
+    } else {
+        "default"
+    };
     let mut flags = Flags {
         json: env_var_is_truthy("AGENT_BROWSER_JSON") || config.json.unwrap_or(false),
         headed: env_var_is_truthy("AGENT_BROWSER_HEADED") || config.headed.unwrap_or(false),
         debug: env_var_is_truthy("AGENT_BROWSER_DEBUG") || config.debug.unwrap_or(false),
-        session: env::var("AGENT_BROWSER_SESSION")
-            .ok()
+        session: session_env
             .or(config.session)
             .unwrap_or_else(|| "default".to_string()),
+        session_source,
         restore: env::var("AGENT_BROWSER_RESTORE").ok().or(config.restore),
         restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
             .ok()
@@ -806,9 +820,13 @@ pub fn parse_flags(args: &[String]) -> Flags {
 
     let mut i = 0;
     let mut seen_command = false;
+    let mut wait_command_seen = false;
     while i < args.len() {
         let arg = args[i].as_str();
         if !arg.starts_with('-') && looks_like_command(arg) {
+            if !seen_command {
+                wait_command_seen = arg == "wait";
+            }
             seen_command = true;
         }
         match arg {
@@ -863,6 +881,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "--session" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.session = s.clone();
+                    flags.session_source = "--session";
                     i += 1;
                 }
             }
@@ -987,10 +1006,12 @@ pub fn parse_flags(args: &[String]) -> Flags {
                 }
             }
             "--state" => {
-                if let Some(s) = args.get(i + 1) {
-                    flags.state = Some(s.clone());
-                    flags.cli_state = true;
-                    i += 1;
+                if !wait_command_seen {
+                    if let Some(s) = args.get(i + 1) {
+                        flags.state = Some(s.clone());
+                        flags.cli_state = true;
+                        i += 1;
+                    }
                 }
             }
             "--proxy" => {
@@ -1262,7 +1283,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         }
         i += 1;
     }
-    flags
+    Ok(flags)
 }
 
 fn looks_like_command(value: &str) -> bool {
@@ -1345,6 +1366,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
 
     let mut i = 0;
     let mut seen_command = false;
+    let mut wait_command_seen = false;
     while i < args.len() {
         let arg = &args[i];
         if skip_next {
@@ -1353,6 +1375,11 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
             continue;
         }
         if arg.starts_with("--restore=") {
+            i += 1;
+            continue;
+        }
+        if arg == "--state" && wait_command_seen {
+            result.push(arg.clone());
             i += 1;
             continue;
         }
@@ -1382,6 +1409,9 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
             continue;
         }
         if !arg.starts_with('-') && looks_like_command(arg) {
+            if !seen_command {
+                wait_command_seen = arg == "wait";
+            }
             seen_command = true;
         }
         result.push(arg.clone());
@@ -1460,6 +1490,47 @@ mod tests {
     fn test_parse_headers_flag() {
         let flags = parse_flags(&args(r#"open example.com --headers {"Auth":"token"}"#));
         assert_eq!(flags.headers, Some(r#"{"Auth":"token"}"#.to_string()));
+    }
+
+    #[test]
+    fn test_wait_state_is_not_parsed_as_global_state() {
+        for input in [
+            "wait #spinner --state hidden",
+            "wait --state hidden #spinner",
+        ] {
+            let flags = parse_flags(&args(input));
+            assert_eq!(flags.state, None);
+            assert!(!flags.cli_state);
+        }
+    }
+
+    #[test]
+    fn test_global_state_before_wait_and_on_other_commands_is_preserved() {
+        let before_wait = parse_flags(&args("--state /tmp/auth.json wait #spinner"));
+        assert_eq!(before_wait.state.as_deref(), Some("/tmp/auth.json"));
+        assert!(before_wait.cli_state);
+
+        let other_command = parse_flags(&args("open example.com --state /tmp/auth.json"));
+        assert_eq!(other_command.state.as_deref(), Some("/tmp/auth.json"));
+        assert!(other_command.cli_state);
+    }
+
+    #[test]
+    fn test_clean_args_keeps_wait_state_and_strips_global_state() {
+        for input in [
+            "wait #spinner --state hidden",
+            "wait --state hidden #spinner",
+        ] {
+            assert_eq!(clean_args(&args(input)), args(input));
+        }
+        assert_eq!(
+            clean_args(&args("--state /tmp/auth.json wait #spinner")),
+            args("wait #spinner")
+        );
+        assert_eq!(
+            clean_args(&args("open example.com --state /tmp/auth.json")),
+            args("open example.com")
+        );
     }
 
     #[test]

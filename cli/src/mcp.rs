@@ -907,10 +907,10 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_SNAPSHOT,
             "Snapshot page",
-            "Return an accessibility-tree snapshot with reusable element refs. If an action reports that a stale ref cannot be recovered, take a new snapshot and use a fresh ref.",
+            "Return an accessibility-tree snapshot with reusable element refs. Presentational iframes use the Iframe role for snapshots and stale-ref recovery. If an action reports that a stale ref cannot be recovered, take a new snapshot and use a fresh ref.",
             json!({
                 "interactive": { "type": "boolean", "default": true, "description": "Only include interactive elements." },
-                "compact": { "type": "boolean", "default": false, "description": "Remove empty structural elements." },
+                "compact": { "type": "boolean", "default": false, "description": "Remove empty structural elements, retaining only matching content and its direct ancestors. With interactive:false, retain visible text." },
                 "depth": { "type": "integer", "minimum": 0, "description": "Limit tree depth." },
                 "selector": { "type": "string", "description": "Scope the snapshot to a CSS selector." },
                 "includeUrls": { "type": "boolean", "default": false, "description": "Include href URLs on links." },
@@ -993,16 +993,17 @@ fn tools() -> Vec<Value> {
         ),
         tool(TOOL_SCROLL_INTO_VIEW, "Scroll into view", "Scroll an element into view.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(TOOL_WAIT_MS, "Wait milliseconds", "Wait for a fixed time.", json!({ "ms": { "type": "integer", "minimum": 0 } }), &["ms"]),
-        wait_tool(
-            TOOL_WAIT_FOR_SELECTOR,
-            "Wait for selector",
-            "Wait for an element with a CSS selector or @ref. Bare integers are rejected because they are treated as millisecond waits; use CSS selector syntax for numeric IDs.",
-            json!({ "selector": selector_schema() }),
-            &["selector"],
-        ),
+        wait_tool(TOOL_WAIT_FOR_SELECTOR, "Wait for selector", "Wait for an element with a CSS selector or @ref to reach a state. Bare integer selectors are rejected; use CSS selector syntax for numeric IDs or agent_browser_wait_ms for a delay.", json!({
+            "selector": selector_schema(),
+            "state": {
+                "type": "string",
+                "enum": ["visible", "hidden", "attached", "detached"],
+                "description": "Element state to wait for."
+            }
+        }), &["selector"]),
         wait_tool(TOOL_WAIT_FOR_TEXT, "Wait for text", "Wait for text to appear.", json!({ "text": { "type": "string" } }), &["text"]),
         wait_tool(TOOL_WAIT_FOR_URL, "Wait for URL", "Wait for the current URL to match a pattern.", json!({ "url": { "type": "string", "description": "URL glob or pattern." } }), &["url"]),
-        wait_tool(TOOL_WAIT_FOR_LOAD, "Wait for load state", "Wait for a page load state.", json!({ "state": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"] } }), &["state"]),
+        wait_tool(TOOL_WAIT_FOR_LOAD, "Wait for load state", "Wait for a page load state. Uses the full wait timeout and returns an error when it expires.", json!({ "state": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"] } }), &["state"]),
         wait_tool(TOOL_WAIT_FOR_FUNCTION, "Wait for function", "Wait for a JavaScript expression to become truthy.", json!({ "expression": { "type": "string" } }), &["expression"]),
         tool(
             TOOL_SCREENSHOT,
@@ -1026,11 +1027,17 @@ fn tools() -> Vec<Value> {
         tool(TOOL_GET_VALUE, "Get value", "Get an input value.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(TOOL_GET_URL, "Get URL", "Get the current page URL.", json!({}), &[]),
         tool(TOOL_GET_TITLE, "Get title", "Get the current page title.", json!({}), &[]),
-        tool(TOOL_GET_CDP_URL, "Get CDP URL", "Get the current browser CDP URL.", json!({}), &[]),
+        tool(
+            TOOL_GET_CDP_URL,
+            "Get CDP URL",
+            "Get the CDP WebSocket URL of a running browser. Never launches a browser.",
+            json!({}),
+            &[],
+        ),
         tool(
             TOOL_EVAL,
             "Evaluate JavaScript",
-            "Run JavaScript in the page using stdin to avoid shell escaping.",
+            "Run JavaScript in the page using stdin to avoid shell escaping. When the top-level result is a value JSON cannot represent, the structured response includes `response.data.unserializable` and the text content prints the JavaScript token.",
             json!({
                 "script": { "type": "string", "description": "JavaScript expression or script to evaluate." }
             }),
@@ -1220,14 +1227,14 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_MOUSE_WHEEL,
             "Mouse wheel",
-            "Scroll with the mouse wheel.",
+            "Scroll with the mouse wheel at the current pointer, initially (0,0). Call agent_browser_mouse_move first to target another location.",
             json!({ "dy": number_schema(), "dx": number_schema() }),
             &["dy"],
         ),
         tool(
             TOOL_SET_VIEWPORT,
             "Set viewport",
-            "Set viewport size.",
+            "Set viewport size. The optional scale must be finite.",
             json!({ "width": int_schema(), "height": int_schema(), "scale": number_schema() }),
             &["width", "height"],
         ),
@@ -1241,7 +1248,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_SET_GEO,
             "Set geolocation",
-            "Set geolocation.",
+            "Set geolocation with finite latitude and longitude.",
             json!({ "latitude": number_schema(), "longitude": number_schema() }),
             &["latitude", "longitude"],
         ),
@@ -1318,21 +1325,21 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_STORAGE_GET,
             "Storage get",
-            "Get localStorage or sessionStorage.",
+            "Get all localStorage or sessionStorage entries, or one key.",
             json!({ "storageType": storage_type_schema(), "key": { "type": "string" } }),
             &["storageType"],
         ),
         tool(
             TOOL_STORAGE_SET,
             "Storage set",
-            "Set localStorage or sessionStorage.",
+            "Set one localStorage or sessionStorage key.",
             json!({ "storageType": storage_type_schema(), "key": { "type": "string" }, "value": { "type": "string" } }),
             &["storageType", "key", "value"],
         ),
         tool(
             TOOL_STORAGE_CLEAR,
             "Storage clear",
-            "Clear localStorage or sessionStorage.",
+            "Clear all localStorage or sessionStorage entries.",
             json!({ "storageType": storage_type_schema() }),
             &["storageType"],
         ),
@@ -1367,8 +1374,15 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_TAB_NEW,
             "Tab new",
-            "Open a new tab after applying session setup before its first navigation.",
-            json!({ "url": { "type": "string" }, "label": { "type": "string" } }),
+            "Open a new tab after applying session setup before its first navigation. Rejected labels preserve the current tab's refs and selected frame.",
+            json!({
+                "url": { "type": "string" },
+                "label": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+                    "description": "Starts with an ASCII letter, then ASCII letters, digits, `-`, or `_`; `t<N>` and `T<N>` forms are reserved for tab IDs."
+                }
+            }),
             &[],
         ),
         tool(TOOL_TAB_LIST, "Tab list", "List tabs.", json!({}), &[]),
@@ -1707,14 +1721,14 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_BATCH,
             "Batch",
-            "Run multiple commands sequentially.",
+            "Run multiple commands sequentially. A batch containing only get cdp-url commands never launches a browser.",
             json!({ "commands": { "type": "array", "items": { "type": "array", "items": { "type": "string" }, "minItems": 1 }, "minItems": 1 }, "bail": { "type": "boolean" }, "omitCommand": { "type": "boolean", "description": "Replace only command arrays with a stable zero-based input index. Does not make output safe for secrets: errors and response data are unchanged; type echoes typed text, and get value/eval may return input values." } }),
             &["commands"],
         ),
         tool(
             TOOL_REACT_TREE,
             "React tree",
-            "Inspect React tree.",
+            "Inspect the React component tree and return its structured result.",
             json!({ "json": { "type": "boolean" } }),
             &[],
         ),
@@ -1865,14 +1879,14 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_SKILLS_LIST,
             "Skills list",
-            "List bundled skills.",
+            "List available skills.",
             json!({}),
             &[],
         ),
         tool(
             TOOL_SKILLS_GET,
             "Skills get",
-            "Get bundled skill content.",
+            "Get skill content, including home-directory skills when no package root is found. Package discovery looks for the bundled skill-data/core/SKILL.md file.",
             json!({ "names": string_array_schema("Skill names."), "all": { "type": "boolean" }, "full": { "type": "boolean" } }),
             &[],
         ),
@@ -1952,8 +1966,8 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_INSTALL,
             "Install",
-            "Install browser binaries.",
-            json!({ "withDeps": { "type": "boolean" } }),
+            "Install browser binaries. On macOS versions below 13, the command stops before downloading Chrome for Testing and prints instructions to update macOS or install Chrome manually. If `sw_vers -productVersion` is unavailable, exits with an error, returns no version, or returns a malformed version, the command reports a detection error and stops before making a network request.",
+            json!({ "withDeps": { "type": "boolean", "description": "Install Linux system dependencies. The package manager runs directly as root; non-root uses sudo." } }),
             &[],
         ),
         tool(
@@ -2036,7 +2050,7 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         "session".to_string(),
         json!({
             "type": "string",
-            "description": "Optional isolated browser session name."
+            "description": "Optional isolated browser session name. Accepts Unicode letters and numbers, hyphens, and underscores only; spaces are rejected."
         }),
     );
     props.insert(
@@ -2367,7 +2381,9 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_SCROLL => call_scroll(arguments),
         TOOL_SCROLL_INTO_VIEW => call_simple_selector(arguments, "scrollintoview"),
         TOOL_WAIT_MS => call_wait_ms(arguments),
-        TOOL_WAIT_FOR_SELECTOR => call_wait_flag(arguments, None, "selector"),
+        TOOL_WAIT_FOR_SELECTOR => {
+            call_cli_tool(arguments, wait_selector_command_args(arguments)?, None)
+        }
         TOOL_WAIT_FOR_TEXT => call_wait_flag(arguments, Some("--text"), "text"),
         TOOL_WAIT_FOR_URL => call_wait_flag(arguments, Some("--url"), "url"),
         TOOL_WAIT_FOR_LOAD => call_wait_flag(arguments, Some("--load"), "state"),
@@ -2565,7 +2581,29 @@ fn call_cli_tool(
     validate_arguments_object(arguments)?;
     let session = optional_string(arguments, "session")?;
     let timeout_ms = optional_timeout(arguments)?;
+    let uses_session = !matches!(
+        command_args.first().map(String::as_str),
+        Some(
+            "install"
+                | "upgrade"
+                | "doctor"
+                | "dashboard"
+                | "profiles"
+                | "skills"
+                | "plugin"
+                | "plugins"
+        )
+    );
     let cli_args = cli_tool_args(arguments, command_args, session.as_deref())?;
+    if uses_session {
+        let flags =
+            crate::flags::try_parse_flags(&cli_args).map_err(ProtocolError::invalid_params)?;
+        if !crate::validation::is_valid_session_name(&flags.session) {
+            return Err(ProtocolError::invalid_params(
+                crate::validation::session_name_error(&flags.session),
+            ));
+        }
+    }
 
     let run = run_cli(&cli_args, stdin_body, timeout_ms).map_err(|e| {
         ProtocolError::invalid_params(format!("Failed to run agent-browser: {}", e))
@@ -2622,12 +2660,22 @@ fn cli_tool_args(
     // The CLI reads global flags anywhere in argv, so a tool argument such as
     // a selector could otherwise carry its own --allowed-domains or --session.
     let trusted: Vec<&str> = args.iter().map(|a| global_flag_name(a)).collect();
+    let wait_selector_state = wait_selector_state_flag_index(&command_args);
     let tokens = command_args
         .iter()
-        .map(|t| (t, MCP_TOOL_GLOBALS))
-        .chain(extra_args.iter().map(|t| (t, &[][..])));
-    for (token, tool_globals) in tokens {
+        .enumerate()
+        .map(|(i, t)| (t, MCP_TOOL_GLOBALS, Some(i)))
+        .chain(extra_args.iter().map(|t| (t, &[][..], None)));
+    for (token, tool_globals, command_index) in tokens {
         let name = global_flag_name(token);
+        if wait_selector_state.is_some() && command_index == wait_selector_state {
+            continue;
+        }
+        if command_index.is_none() && name == "--state" {
+            return Err(ProtocolError::invalid_params(
+                "Tool arguments may not set --state; configure it in the MCP server's environment or config",
+            ));
+        }
         if !crate::flags::clean_args(&[name.to_string()]).is_empty() {
             continue;
         }
@@ -2647,6 +2695,21 @@ fn cli_tool_args(
     args.extend(command_args);
     args.extend(extra_args);
     Ok(args)
+}
+
+fn wait_selector_state_flag_index(command_args: &[String]) -> Option<usize> {
+    if command_args.len() < 4
+        || command_args[0] != "wait"
+        || command_args[1].starts_with('-')
+        || command_args[2] != "--state"
+        || !matches!(
+            command_args[3].as_str(),
+            "visible" | "hidden" | "attached" | "detached"
+        )
+    {
+        return None;
+    }
+    Some(2)
 }
 
 fn global_flag_name(token: &str) -> &str {
@@ -2955,6 +3018,32 @@ fn call_wait_ms(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, vec!["wait".to_string(), ms.to_string()], None)
 }
 
+fn wait_selector_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let selector = required_string(arguments, "selector")?;
+    if selector.parse::<u64>().is_ok() {
+        return Err(ProtocolError::invalid_params(
+            "Bare integer selectors are rejected. Use CSS selector syntax for numeric IDs or agent_browser_wait_ms for a delay.",
+        ));
+    }
+    let mut args = vec!["wait".to_string(), selector];
+    if let Some(state) = optional_string(arguments, "state")? {
+        if !matches!(
+            state.as_str(),
+            "visible" | "hidden" | "attached" | "detached"
+        ) {
+            return Err(ProtocolError::invalid_params(format!(
+                "state expects visible, hidden, attached, or detached, got '{}'",
+                state
+            )));
+        }
+        args.extend(["--state".to_string(), state]);
+    }
+    if let Some(timeout) = optional_u64(arguments, "waitTimeoutMs")? {
+        args.extend(["--timeout".to_string(), timeout.to_string()]);
+    }
+    Ok(args)
+}
+
 fn call_wait_flag(
     arguments: &Value,
     flag: Option<&str>,
@@ -2963,7 +3052,7 @@ fn call_wait_flag(
     let value = required_string(arguments, value_key)?;
     if flag.is_none() && value.parse::<u64>().is_ok() {
         return Err(ProtocolError::invalid_params(
-            "A bare integer selector is treated as a millisecond wait. Use CSS selector syntax for numeric IDs or agent_browser_wait_ms for a delay.",
+            "Bare integer selectors are rejected. Use CSS selector syntax for numeric IDs or agent_browser_wait_ms for a delay.",
         ));
     }
     let mut args = vec!["wait".to_string()];
@@ -3828,12 +3917,16 @@ fn call_dashboard_start(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, dashboard_start_args(arguments)?, None)
 }
 
-fn call_install(arguments: &Value) -> Result<Value, ProtocolError> {
+fn install_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     let mut args = vec!["install".to_string()];
     if optional_bool(arguments, "withDeps")?.unwrap_or(false) {
         args.push("--with-deps".to_string());
     }
-    call_cli_tool(arguments, args, None)
+    Ok(args)
+}
+
+fn call_install(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, install_args(arguments)?, None)
 }
 
 fn call_chat(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -4337,6 +4430,9 @@ fn response_text(value: &Value) -> Option<String> {
         }
 
         if let Some(data) = obj.get("data") {
+            if let Some(token) = data.get("unserializable").and_then(Value::as_str) {
+                return Some(token.to_string());
+            }
             // Accessibility reports carry a URL alongside their findings. Use
             // the same report formatter as the CLI before the generic string
             // field fallback turns the MCP text content into only that URL.
@@ -4492,6 +4588,7 @@ mod tests {
         for arguments in [
             json!({}),
             json!({"interactive": false, "selector": "#content"}),
+            json!({"compact": true, "interactive": false}),
         ] {
             let args = snapshot_command_args(&arguments).unwrap();
             let flags = crate::flags::parse_flags(&args);
@@ -4502,6 +4599,9 @@ mod tests {
                 command["interactive"].as_bool().unwrap_or(false),
                 arguments["interactive"].as_bool().unwrap_or(true)
             );
+            if arguments["compact"] == true {
+                assert_eq!(command["compact"], true);
+            }
         }
     }
 
@@ -4540,7 +4640,9 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, -32602);
-        assert!(error.message.contains("millisecond wait"));
+        assert!(error
+            .message
+            .contains("Bare integer selectors are rejected"));
     }
 
     #[cfg(unix)]
@@ -4576,6 +4678,74 @@ mod tests {
         assert!(names.contains(&TOOL_SESSION_INFO));
         assert!(!names.contains(&"agent_browser_frame_list"));
         assert!(names.iter().all(|name| name.starts_with("agent_browser_")));
+    }
+
+    #[test]
+    fn wait_for_selector_rejects_invalid_state_at_mcp_boundary() {
+        for state in ["gone", "/tmp/auth.json", "", "Visible"] {
+            let error = call_tool(
+                Some(&json!({
+                    "name": TOOL_WAIT_FOR_SELECTOR,
+                    "arguments": { "selector": "#spinner", "state": state }
+                })),
+                &McpConfig::all(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, -32602);
+            assert!(error
+                .message
+                .contains("state expects visible, hidden, attached, or detached"));
+            assert!(error.message.contains(&format!("got '{}'", state)));
+        }
+    }
+
+    #[test]
+    fn wait_for_selector_state_is_optional_and_maps_to_cli() {
+        let selector_tool = tools()
+            .into_iter()
+            .find(|tool| tool["name"].as_str() == Some(TOOL_WAIT_FOR_SELECTOR))
+            .unwrap();
+        assert_eq!(
+            selector_tool["inputSchema"]["properties"]["state"]["enum"],
+            json!(["visible", "hidden", "attached", "detached"])
+        );
+        assert_eq!(
+            selector_tool["inputSchema"]["required"],
+            json!(["selector"])
+        );
+        assert!(selector_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("Bare integer selectors are rejected"));
+
+        let with_state = wait_selector_command_args(&json!({
+            "selector": "#target",
+            "state": "hidden",
+            "waitTimeoutMs": 500
+        }))
+        .unwrap();
+        assert_eq!(
+            with_state,
+            ["wait", "#target", "--state", "hidden", "--timeout", "500"]
+        );
+        let flags = crate::flags::parse_flags(&with_state);
+        let command =
+            crate::commands::parse_command(&crate::flags::clean_args(&with_state), &flags).unwrap();
+        assert_eq!(command["state"], "hidden");
+        assert_eq!(command["timeout"], 500);
+
+        let without_state = wait_selector_command_args(&json!({
+            "selector": "#target",
+            "waitTimeoutMs": 500
+        }))
+        .unwrap();
+        assert_eq!(without_state, ["wait", "#target", "--timeout", "500"]);
+        let flags = crate::flags::parse_flags(&without_state);
+        let command =
+            crate::commands::parse_command(&crate::flags::clean_args(&without_state), &flags)
+                .unwrap();
+        assert!(command.get("state").is_none());
+        assert_eq!(command["timeout"], 500);
     }
 
     #[test]
@@ -4762,6 +4932,14 @@ mod tests {
         assert_eq!(
             doctor_args(&json!({ "debug": true })).unwrap(),
             vec!["doctor", "--debug", "true"]
+        );
+    }
+
+    #[test]
+    fn install_args_maps_with_deps_to_cli_flag() {
+        assert_eq!(
+            install_args(&json!({ "withDeps": true })).unwrap(),
+            vec!["install", "--with-deps"]
         );
     }
 
@@ -5078,11 +5256,14 @@ mod tests {
     }
 
     #[test]
-    fn react_json_uses_command_local_raw_json_flag() {
+    fn react_json_uses_structured_cli_mode_and_command_local_raw_json_flag() {
         let mut args = vec!["react".to_string(), "tree".to_string()];
         append_react_raw_json_arg(&json!({ "json": true }), &mut args).unwrap();
 
         assert_eq!(args, vec!["react", "tree", RAW_JSON_ARG]);
+        let cli_args = cli_tool_args(&json!({}), args, None).unwrap();
+
+        assert_eq!(cli_args, vec!["--json", "react", "tree", RAW_JSON_ARG]);
     }
 
     #[test]
@@ -5216,6 +5397,45 @@ mod tests {
         assert!(screenshot.is_ok());
         let extra = json!({ "extraArgs": ["--screenshot-dir", "/tmp"] });
         assert!(cli_tool_args(&extra, vec!["open".to_string()], None).is_err());
+    }
+
+    #[test]
+    fn selector_wait_state_passes_cli_tool_args_without_opening_global_state() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_CONFIG",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_CONFIG");
+
+        for state in ["visible", "hidden", "attached", "detached"] {
+            let arguments = json!({"state": state, "waitTimeoutMs": 100});
+            let command_args = wait_selector_command_args(&json!({
+                "selector": "#spinner",
+                "state": state,
+                "waitTimeoutMs": 100
+            }))
+            .unwrap();
+            let args = cli_tool_args(&arguments, command_args, None).unwrap();
+            assert!(args.windows(2).any(|pair| pair == ["--state", state]));
+            let flags = crate::flags::parse_flags(&args);
+            assert_eq!(flags.state, None);
+            assert!(!flags.cli_state);
+        }
+
+        for extra_args in [
+            json!({"extraArgs": ["--state", "/tmp/auth.json"]}),
+            json!({"extraArgs": ["--state=/tmp/auth.json"]}),
+        ] {
+            let error = cli_tool_args(&extra_args, vec!["wait".into(), "#spinner".into()], None)
+                .unwrap_err();
+            assert!(error.message.contains("may not set --state"));
+        }
+
+        let operator_cli = ["--state", "/tmp/auth.json", "wait", "#spinner"].map(str::to_string);
+        let flags = crate::flags::parse_flags(&operator_cli);
+        assert_eq!(flags.state.as_deref(), Some("/tmp/auth.json"));
+        assert!(flags.cli_state);
     }
 
     #[test]
@@ -5829,6 +6049,55 @@ mod tests {
     fn required_string_rejects_missing_field() {
         let err = required_string(&json!({}), "selector").unwrap_err();
         assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn call_tool_rejects_invalid_session_name() {
+        let err = call_tool(
+            Some(&json!({
+                "name": TOOL_GET_URL,
+                "arguments": { "session": "has space" }
+            })),
+            &McpConfig::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, -32602);
+        assert_eq!(
+            err.message,
+            crate::validation::session_name_error("has space")
+        );
+    }
+
+    #[test]
+    fn call_cli_tool_rejects_invalid_extra_session_before_child_spawn() {
+        let err = call_cli_tool(
+            &json!({"extraArgs": ["--session", "has space"]}),
+            Vec::new(),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, -32602);
+        assert_eq!(
+            err.message,
+            crate::validation::session_name_error("has space")
+        );
+    }
+
+    #[test]
+    fn call_cli_tool_rejects_invalid_inherited_session_with_equals_extra_arg() {
+        let env = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_SESSION"]);
+        env.set("AGENT_BROWSER_SESSION", "has space");
+
+        let err = call_cli_tool(&json!({"extraArgs": ["--session=valid"]}), Vec::new(), None)
+            .unwrap_err();
+
+        assert_eq!(err.code, -32602);
+        assert_eq!(
+            err.message,
+            crate::validation::session_name_error("has space")
+        );
     }
 
     #[test]

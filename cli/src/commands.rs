@@ -343,6 +343,7 @@ pub fn parse_cdp_headers(raw: &str) -> Result<Value, String> {
 }
 
 /// Parses command arguments into normalized command data.
+/// Wait selector `--state` values are accepted only for selector waits.
 pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
     let mut result = parse_command_inner(args, flags)?;
 
@@ -731,6 +732,48 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 })?);
                 rest.drain(idx..=idx + 1);
             }
+            let mut element_state: Option<&str> = None;
+            if let Some(idx) = rest.iter().position(|&s| s == "--state") {
+                let raw = rest
+                    .get(idx + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "wait --state".to_string(),
+                        usage: "wait <selector> --state <visible|hidden|attached|detached>",
+                    })?;
+                if !matches!(*raw, "visible" | "hidden" | "attached" | "detached") {
+                    return Err(ParseError::InvalidValue {
+                        message: format!(
+                            "--state expects visible, hidden, attached, or detached, got '{}'. To load a state file, put --state <path> before wait.",
+                            raw
+                        ),
+                        usage: "wait <selector> --state <visible|hidden|attached|detached>",
+                    });
+                }
+                element_state = Some(*raw);
+                rest.drain(idx..=idx + 1);
+            }
+            let uses_non_selector_wait =
+                rest.iter().any(|arg| {
+                    matches!(
+                        *arg,
+                        "--url"
+                            | "-u"
+                            | "--load"
+                            | "-l"
+                            | "--fn"
+                            | "-f"
+                            | "--text"
+                            | "-t"
+                            | "--download"
+                            | "-d"
+                    )
+                }) || rest.first().is_some_and(|arg| arg.parse::<u64>().is_ok());
+            if element_state.is_some() && uses_non_selector_wait {
+                return Err(ParseError::InvalidValue {
+                    message: "--state can only be used with a selector wait".to_string(),
+                    usage: "wait <selector> --state <visible|hidden|attached|detached>",
+                });
+            }
             let with_timeout = |mut cmd: Value| {
                 if let Some(ms) = timeout_ms {
                     cmd["timeout"] = json!(ms);
@@ -811,9 +854,11 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 if let Ok(timeout) = arg.parse::<u64>() {
                     Ok(json!({ "id": id, "action": "wait", "timeout": timeout }))
                 } else {
-                    Ok(with_timeout(
-                        json!({ "id": id, "action": "wait", "selector": arg }),
-                    ))
+                    let mut cmd = json!({ "id": id, "action": "wait", "selector": arg });
+                    if let Some(state) = element_state {
+                        cmd["state"] = json!(state);
+                    }
+                    Ok(with_timeout(cmd))
                 }
             } else {
                 Err(ParseError::MissingArguments {
@@ -3284,6 +3329,17 @@ fn parse_mouse(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     }
 }
 
+/// Parse a finite floating-point argument for JSON serialization.
+fn parse_finite_f64(raw: &str, what: &str, usage: &'static str) -> Result<f64, ParseError> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| ParseError::InvalidValue {
+            message: format!("{} expects a finite number, got '{}'", what, raw),
+            usage,
+        })
+}
+
 fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     const VALID: &[&str] = &[
         "viewport",
@@ -3321,12 +3377,11 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 })?;
             let mut cmd = json!({ "id": id, "action": "viewport", "width": w, "height": h });
             if let Some(scale_str) = rest.get(3) {
-                let scale = scale_str
-                    .parse::<f64>()
-                    .map_err(|_| ParseError::MissingArguments {
-                        context: "set viewport".to_string(),
-                        usage: "set viewport <width> <height> [scale]",
-                    })?;
+                let scale = parse_finite_f64(
+                    scale_str,
+                    "set viewport scale",
+                    "set viewport <width> <height> [scale]",
+                )?;
                 cmd["deviceScaleFactor"] = json!(scale);
             }
             Ok(cmd)
@@ -3347,18 +3402,16 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 context: "set geo".to_string(),
                 usage: "set geo <latitude> <longitude>",
             })?;
-            let lat = lat_str
-                .parse::<f64>()
-                .map_err(|_| ParseError::MissingArguments {
-                    context: "set geo".to_string(),
-                    usage: "set geo <latitude> <longitude>",
-                })?;
-            let lng = lng_str
-                .parse::<f64>()
-                .map_err(|_| ParseError::MissingArguments {
-                    context: "set geo".to_string(),
-                    usage: "set geo <latitude> <longitude>",
-                })?;
+            let lat = parse_finite_f64(
+                lat_str,
+                "set geo latitude",
+                "set geo <latitude> <longitude>",
+            )?;
+            let lng = parse_finite_f64(
+                lng_str,
+                "set geo longitude",
+                "set geo <latitude> <longitude>",
+            )?;
             Ok(json!({ "id": id, "action": "geolocation", "latitude": lat, "longitude": lng }))
         }
         Some("offline") => {
@@ -3548,19 +3601,27 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     }
 }
 
+/// Parses storage operations with exact operand counts and one-key read shorthand.
 fn parse_storage(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     const VALID: &[&str] = &["local", "session"];
 
     match rest.first().copied() {
         Some("local") | Some("session") => {
             let storage_type = rest.first().unwrap();
-            let (op, key, value) = match rest.get(1) {
-                Some(&"get") => ("get", rest.get(2), rest.get(3)),
-                Some(&"set") => ("set", rest.get(2), rest.get(3)),
-                Some(&"clear") => ("clear", rest.get(2), rest.get(3)),
-                Some(_) => ("get", rest.get(1), rest.get(2)),
-                None => ("get", None, None),
+            let (op, key, value, max_rest_len) = match rest.get(1) {
+                Some(&"get") => ("get", rest.get(2), None, 3),
+                Some(&"set") => ("set", rest.get(2), rest.get(3), 4),
+                Some(&"clear") => ("clear", None, None, 2),
+                Some(_) => ("get", rest.get(1), None, 2),
+                None => ("get", None, None, 2),
             };
+            if let Some(extra) = rest.get(max_rest_len) {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unexpected argument: {}", extra),
+                    usage:
+                        "storage <local|session> [get [key] | set <key> <value> | clear | <key>]",
+                });
+            }
             match op {
                 "set" => {
                     let k = key.ok_or_else(|| ParseError::MissingArguments {
@@ -3594,7 +3655,7 @@ fn parse_storage(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         }),
         None => Err(ParseError::MissingArguments {
             context: "storage".to_string(),
-            usage: "storage <local|session> [get|set|clear] [key] [value]",
+            usage: "storage <local|session> [get [key] | set <key> <value> | clear | <key>]",
         }),
     }
 }
@@ -3638,6 +3699,7 @@ mod tests {
     fn default_flags() -> Flags {
         Flags {
             session: "test".to_string(),
+            session_source: "--session",
             json: false,
             headed: false,
             debug: false,
@@ -4211,6 +4273,52 @@ mod tests {
         assert_eq!(cmd["action"], "storage_get");
         assert_eq!(cmd["type"], "local");
         assert_eq!(cmd["key"], "mykey");
+    }
+
+    #[test]
+    fn test_storage_implicit_get_rejects_extra_operands_and_preserves_keys() {
+        for storage_type in ["local", "session"] {
+            for key in ["delete", "remove"] {
+                let bare = parse_command(
+                    &args(&format!("storage {storage_type} {key}")),
+                    &default_flags(),
+                )
+                .unwrap();
+                assert_eq!(bare["action"], "storage_get");
+                assert_eq!(bare["type"], storage_type);
+                assert_eq!(bare["key"], key);
+
+                let err = parse_command(
+                    &args(&format!("storage {storage_type} {key} extra")),
+                    &default_flags(),
+                )
+                .unwrap_err();
+                match err {
+                    ParseError::InvalidValue { message, usage } => {
+                        assert!(message.contains("Unexpected argument: extra"));
+                        assert!(usage.contains("<key>"));
+                    }
+                    other => panic!("expected InvalidValue, got {:?}", other),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_storage_operations_reject_extra_operands() {
+        for (command, extra) in [
+            ("storage local get greeting extra", "extra"),
+            ("storage local set greeting hello world", "world"),
+            ("storage local clear greeting", "greeting"),
+        ] {
+            let error = parse_command(&args(command), &default_flags()).unwrap_err();
+            match error {
+                ParseError::InvalidValue { message, .. } => {
+                    assert_eq!(message, format!("Unexpected argument: {}", extra));
+                }
+                other => panic!("expected InvalidValue, got {:?}", other),
+            }
+        }
     }
 
     #[test]
@@ -5052,6 +5160,61 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_selector_state_in_either_order() {
+        for (command, state) in [
+            ("wait #spinner --state visible", "visible"),
+            ("wait --state hidden #spinner", "hidden"),
+            ("wait #spinner --state attached", "attached"),
+            ("wait --state detached #spinner", "detached"),
+        ] {
+            let cmd = parse_command(&args(command), &default_flags()).unwrap();
+            assert_eq!(cmd["selector"], "#spinner");
+            assert_eq!(cmd["state"], state);
+        }
+    }
+
+    #[test]
+    fn test_wait_selector_state_with_timeout() {
+        let cmd = parse_command(
+            &args("wait --state hidden #spinner --timeout 9000"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["state"], "hidden");
+        assert_eq!(cmd["timeout"], 9000);
+    }
+
+    #[test]
+    fn test_wait_selector_state_rejects_unknown_value() {
+        for state in ["gone", "/tmp/auth.json"] {
+            let error = parse_command(
+                &args(&format!("wait #spinner --state {state}")),
+                &default_flags(),
+            )
+            .unwrap_err();
+            assert!(matches!(error, ParseError::InvalidValue { .. }));
+            assert!(error.format().contains("put --state <path> before wait"));
+        }
+    }
+
+    #[test]
+    fn test_wait_selector_state_rejects_non_selector_waits() {
+        for command in [
+            "wait --url **/dashboard --state hidden",
+            "wait --load networkidle --state hidden",
+            "wait --fn true --state hidden",
+            "wait --text Ready --state hidden",
+            "wait --download --state hidden",
+            "wait 1000 --state hidden",
+        ] {
+            assert!(matches!(
+                parse_command(&args(command), &default_flags()),
+                Err(ParseError::InvalidValue { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn test_wait_timeout() {
         let cmd = parse_command(&args("wait 5000"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "wait");
@@ -5724,6 +5887,25 @@ mod tests {
     fn test_set_viewport_invalid_scale() {
         let result = parse_command(&args("set viewport 1920 1080 abc"), &default_flags());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_rejects_non_finite_float_arguments() {
+        for command in [
+            "set viewport 800 600 nan",
+            "set viewport 800 600 inf",
+            "set geo nan 10",
+            "set geo 10 inf",
+        ] {
+            let error = parse_command(&args(command), &default_flags())
+                .unwrap_err()
+                .format();
+            assert!(
+                error.contains("finite number"),
+                "command should reject non-finite value: {}",
+                command
+            );
+        }
     }
 
     #[test]

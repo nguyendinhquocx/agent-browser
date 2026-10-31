@@ -10,6 +10,10 @@
         "to": "# Clear CA trust retained by the running session\n--use-system-ca          # Use the OS trust store for CLI requests (read, install, upgrade, doctor)"
       },
       {
+        "from": "agent-browser batch \\\n  '[\"open\"]' \\\n  '[\"network\",\"route\",\"*\",\"--abort\",\"--resource-type\",\"script\"]' \\\n  '[\"cookies\",\"set\",\"--curl\",\"cookies.curl\",\"--domain\",\"localhost\"]' \\\n  '[\"navigate\",\"http://localhost:3000/target\"]'",
+        "to": "agent-browser batch \\\n  \"open\" \\\n  \"network route * --abort --resource-type script\" \\\n  \"cookies set --curl cookies.curl --domain localhost\" \\\n  \"navigate http://localhost:3000/target\""
+      },
+      {
         "from": "Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity.",
         "to": "Each tool also accepts `extraArgs` for per-command options and display or emulation flags such as `--engine`; `extraArgs` cannot set `--config` or global flags that change network, file, policy, or host access. Set host-wide options in the MCP server's environment or selected config. Structured `allowedDomains` is rejected when the server already sets allowed domains."
       },
@@ -156,6 +160,18 @@
         "to": "Navigation, action, and output controls are opt-in. By default, agent-browser imposes no restrictions on navigation, actions, or output. Auto-discovered project config filtering applies by default; see Project config trust."
       }
     ],
+    "/init-scripts": [
+      {
+        "from": "agent-browser batch \\\n  '[\"open\"]' \\\n  '[\"network\",\"route\",\"*\",\"--abort\",\"--resource-type\",\"script\"]' \\\n  '[\"cookies\",\"set\",\"--curl\",\"cookies.curl\",\"--domain\",\"localhost\"]' \\\n  '[\"navigate\",\"http://localhost:3000/target\"]'",
+        "to": "agent-browser batch \\\n  \"open\" \\\n  \"network route * --abort --resource-type script\" \\\n  \"cookies set --curl cookies.curl --domain localhost\" \\\n  \"navigate http://localhost:3000/target\""
+      }
+    ],
+    "/network": [
+      {
+        "from": "agent-browser batch \\\n  '[\"open\"]' \\\n  '[\"network\",\"route\",\"*\",\"--abort\",\"--resource-type\",\"script\"]' \\\n  '[\"navigate\",\"http://localhost:3000\"]' \\\n  '[\"snapshot\",\"-i\"]'",
+        "to": "agent-browser batch \\\n  \"open\" \\\n  \"network route * --abort --resource-type script\" \\\n  \"navigate http://localhost:3000\" \\\n  \"snapshot -i\""
+      }
+    ],
     "/proxy": [
       {
         "from": "--ca-cert /etc/ssl/certs/proxy-ca.pem open https://example.com",
@@ -210,6 +226,16 @@
       {
         "from": "The agent gets namespaced tools such as browser__navigate, browser__snapshot, browser__click, browser__fill, browser__find, browser__screenshot, browser__console, and browser__network_requests.",
         "to": "The agent gets namespaced tools such as browser__open, browser__snapshot, browser__click, browser__fill, browser__find, browser__screenshot, browser__console, and browser__network_requests."
+      }
+    ],
+    "/sessions": [
+      {
+        "from": "Session and restore names must contain only alphanumeric characters, hyphens, and underscores. Use `agent-browser session id` to generate a valid key:",
+        "to": "Session and restore names accept Unicode letters and numbers, hyphens, and underscores only. For example, `café-東京_7` is valid, while `my session` is rejected because it contains a space.\n\nUse `agent-browser session id` to generate a valid key:"
+      },
+      {
+        "from": "Session and restore names must contain only alphanumeric characters, hyphens, and underscores. Use agent-browser session id to generate a valid key:",
+        "to": "Session and restore names accept Unicode letters and numbers, hyphens, and underscores only. For example, café-東京_7 is valid, while my session is rejected because it contains a space.\n\nUse agent-browser session id to generate a valid key:"
       }
     ],
     "/webgpu": [
