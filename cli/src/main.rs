@@ -241,6 +241,10 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
         return Some("Cannot use --cdp and -p/--provider together");
     }
 
+    if flags.cli_auto_connect && flags.no_auto_connect {
+        return Some("Cannot use --auto-connect and --no-auto-connect together");
+    }
+
     if flags.auto_connect && flags.cdp.is_some() {
         return Some("Cannot use --auto-connect and --cdp together");
     }
@@ -1684,6 +1688,7 @@ fn main() {
                 error: None,
                 code: None,
                 warning: None,
+                recorded: None,
             },
             Err(e) => connection::Response {
                 success: false,
@@ -1691,6 +1696,7 @@ fn main() {
                 error: Some(e),
                 code: None,
                 warning: None,
+                recorded: None,
             },
         };
         let output_opts = OutputOptions::from_flags(&flags);
@@ -1962,7 +1968,7 @@ fn run_batch(
             continue;
         }
 
-        let mut parsed = match parse_command(cmd_args, flags) {
+        let mut parsed = match commands::parse_batch_command(cmd_args, flags) {
             Ok(mut c) => {
                 if flags.default_timeout.is_none() {
                     commands::inherit_wait_timeout(
@@ -2487,6 +2493,7 @@ mod tests {
         flags.download_path = None;
         flags.engine = None;
         flags.allowed_domains = None;
+        flags.capture = None;
         flags.init_scripts.clear();
         flags.enable.clear();
         flags.extensions.clear();
@@ -2711,6 +2718,21 @@ mod tests {
     }
 
     #[test]
+    fn test_incompatible_launch_mode_error_rejects_no_auto_connect_with_auto_connect() {
+        let mut flags = launch_mode_flags(true, false, false, false);
+        flags.cli_auto_connect = true;
+        flags.no_auto_connect = true;
+        assert_eq!(
+            incompatible_launch_mode_error(&flags),
+            Some("Cannot use --auto-connect and --no-auto-connect together")
+        );
+
+        let mut reset = launch_mode_flags(false, false, false, false);
+        reset.no_auto_connect = true;
+        assert_eq!(incompatible_launch_mode_error(&reset), None);
+    }
+
+    #[test]
     fn test_incompatible_launch_mode_error_rejects_webgpu_attach_modes() {
         let with_webgpu = |mut flags: Flags| {
             flags.webgpu = true;
@@ -2869,6 +2891,7 @@ mod tests {
             })),
             error: None,
             warning: None,
+            recorded: None,
         };
 
         let prompt = confirmation_prompt_from_response(&resp).unwrap();
