@@ -15,6 +15,7 @@ pub mod http;
 #[cfg(test)]
 mod memory;
 mod model;
+pub mod net;
 mod outcome;
 mod recorder;
 mod send;
@@ -24,6 +25,7 @@ pub use hint::*;
 pub use hosts::*;
 pub use http::*;
 pub use model::*;
+pub use net::{recorded_local_host, RecordedReach};
 pub use outcome::*;
 pub use recorder::*;
 pub use send::*;
@@ -329,6 +331,27 @@ pub struct SaveInput<'a> {
     pub created_at: String,
     /// The page shows a password field at save time.
     pub login_wall: bool,
+    /// Hosts the browser reached only at non-public addresses, which still
+    /// resolve only to non-public addresses at save time.
+    pub local_names: &'a [(String, net::Reach)],
+}
+
+/// `Local` for a start host named by a domain that the recording reached
+/// only at non-public addresses; a host the URL already marks local, or a
+/// public one, records nothing.
+fn recorded_reach(start: &str, local_names: &[(String, net::Reach)]) -> Option<net::Reach> {
+    let host = url::Url::parse(start)
+        .ok()?
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if net::Reach::of_start(start) != net::Reach::Public {
+        return None;
+    }
+    local_names
+        .iter()
+        .find(|(h, _)| *h == host)
+        .map(|(_, reach)| *reach)
 }
 
 fn start_url(commands: &[(u64, Value)]) -> Option<String> {
@@ -352,7 +375,7 @@ pub fn describe_command(cmd: &Value) -> String {
 
 /// How a dropped request is named: its path without the query, with any
 /// segment that holds a secret hidden. When the secret is unknown, only the host.
-fn dropped_name(e: &HarEntry, secrets: &[String], known: bool) -> String {
+pub(super) fn dropped_name(e: &HarEntry, secrets: &[String], known: bool) -> String {
     let Ok(url) = url::Url::parse(&e.url) else {
         return format!("{} ?", e.method);
     };
@@ -363,13 +386,13 @@ fn dropped_name(e: &HarEntry, secrets: &[String], known: bool) -> String {
         .path()
         .split('/')
         .map(|seg| {
-            let decoded = urlencoding::decode(seg).map(|d| d.into_owned());
+            let decoded = percent_decode_lossless(seg);
             let hit = secrets.iter().any(|s| {
                 let escaped = serde_json::to_string(s).unwrap_or_default();
                 seg.contains(s.as_str())
                     || seg.contains(urlencoding::encode(s).as_ref())
                     || seg.contains(escaped.trim_matches('"'))
-                    || decoded.as_ref().is_ok_and(|d| d.contains(s.as_str()))
+                    || decoded.contains(s.as_str())
             });
             if hit { "<redacted>" } else { seg }.to_string()
         })
@@ -381,7 +404,7 @@ fn dropped_name(e: &HarEntry, secrets: &[String], known: bool) -> String {
     format!("{} {}", e.method, path)
 }
 
-fn carries_secret(e: &HarEntry, secrets: &[String]) -> bool {
+pub(super) fn carries_secret(e: &HarEntry, secrets: &[String]) -> bool {
     holds_secret(&e.url, secrets)
         || e.post_data
             .as_deref()
@@ -406,17 +429,61 @@ fn holds_secret(text: &str, secrets: &[String]) -> bool {
     })
 }
 
+/// Percent decoding that never fails: an escape that does not form valid
+/// UTF-8 stays exactly as written, so the rest of the text is still compared.
+fn percent_decode_lossless(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    // Decoded bytes of a run of escapes, each with the source it came from.
+    let mut run: Vec<(u8, &str)> = Vec::new();
+    let flush = |run: &mut Vec<(u8, &str)>, out: &mut String| {
+        let raw: Vec<u8> = run.iter().map(|(b, _)| *b).collect();
+        let mut at = 0;
+        while at < raw.len() {
+            match std::str::from_utf8(&raw[at..]) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    break;
+                }
+                Err(e) => {
+                    let good = at + e.valid_up_to();
+                    out.push_str(std::str::from_utf8(&raw[at..good]).unwrap_or(""));
+                    let end = good + e.error_len().unwrap_or(raw.len() - good);
+                    for (_, src) in &run[good..end] {
+                        out.push_str(src);
+                    }
+                    at = end;
+                }
+            }
+        }
+        run.clear();
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                run.push(((h * 16 + l) as u8, &text[i..i + 3]));
+                i += 3;
+                continue;
+            }
+        }
+        flush(&mut run, &mut out);
+        let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 /// A request text as the server reads it: form encoding (`+` is a space),
 /// percent encoding, and the strings inside a JSON body, whose escapes the
 /// parser resolves.
 fn decoded_forms(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    if let Ok(plus) = urlencoding::decode(&text.replace('+', " ")) {
-        out.push(plus.into_owned());
-    }
-    if let Ok(pct) = urlencoding::decode(text) {
-        out.push(pct.into_owned());
-    }
+    out.push(percent_decode_lossless(&text.replace('+', " ")));
+    out.push(percent_decode_lossless(text));
     if let Ok(json) = serde_json::from_str::<Value>(text) {
         let mut strings = Vec::new();
         collect_scalars(&json, &mut strings);
@@ -579,24 +646,38 @@ fn with_page_query_params(
     out
 }
 
-/// Build the flow file and the save report from what was recorded.
-pub fn build_flow(input: SaveInput<'_>) -> Result<(Flow, Value), String> {
-    let start = start_url(input.commands)
+/// The page a saved range starts on: its first `open`, else the page the
+/// first step ran on, else the page open when capture began.
+pub(super) fn save_start_url(commands: &[(u64, Value)], recorder: &FlowRecorder) -> Option<String> {
+    start_url(commands)
         .or_else(|| {
-            input
-                .commands
+            commands
                 .first()
-                .and_then(|(seq, _)| input.recorder.meta.get(seq))
+                .and_then(|(seq, _)| recorder.meta.get(seq))
                 .and_then(|m| m.from_url.clone())
                 .filter(|u| u.starts_with("http"))
         })
-        .or_else(|| {
-            input
-                .recorder
-                .page_url
-                .clone()
-                .filter(|u| u.starts_with("http"))
-        })
+        .or_else(|| recorder.page_url.clone().filter(|u| u.starts_with("http")))
+}
+
+/// An unfinished entry that could still become a flow request: it is
+/// first-party, not telemetry, an XHR/Fetch or a document, and its response
+/// (if the headers already arrived) is not a stream.
+pub(super) fn may_become_candidate(e: &HarEntry, policy: &HostPolicy) -> bool {
+    if !policy.allows_url(&e.url) || is_telemetry(&e.url) {
+        return false;
+    }
+    let mime = e.mime_type.to_ascii_lowercase();
+    match e.resource_type.as_str() {
+        "XHR" | "Fetch" => mime.is_empty() || mime.contains("json"),
+        "Document" => mime.is_empty() || mime.contains("html"),
+        _ => false,
+    }
+}
+
+/// Build the flow file and the save report from what was recorded.
+pub fn build_flow(input: SaveInput<'_>) -> Result<(Flow, Value), String> {
+    let start = save_start_url(input.commands, input.recorder)
         .ok_or("nothing to save: the flow has no `open <url>` command and no page was open")?;
     let host = host_of(&start).ok_or("the flow's start URL has no host")?;
     let base = base_domain(&host);
@@ -785,9 +866,19 @@ pub fn build_flow(input: SaveInput<'_>) -> Result<(Flow, Value), String> {
             } else {
                 "only third-party traffic"
             };
-            gaps.push(
-                json!({ "step": index + 1, "command": describe_command(cmd), "reason": reason }),
-            );
+            // `kind` marks the reason a step with no request gets, so a save
+            // can replace it; the save report does not carry it.
+            let kind = if reason.starts_with("the page asked") {
+                "login-wall"
+            } else {
+                "no-requests"
+            };
+            gaps.push(json!({
+                "step": index + 1,
+                "command": describe_command(cmd),
+                "reason": reason,
+                "kind": kind,
+            }));
         }
         steps.push(Step {
             seq: *seq,
@@ -939,6 +1030,7 @@ pub fn build_flow(input: SaveInput<'_>) -> Result<(Flow, Value), String> {
         origin: host.clone(),
         start_url: start.clone(),
         allowed_hosts: policy.hosts().to_vec(),
+        reach: recorded_reach(&start, input.local_names),
         created_at: input.created_at.clone(),
         created_by: Some(CreatedBy {
             tool: "agent-browser".to_string(),
@@ -2050,6 +2142,71 @@ pub(crate) fn flow_of(mut v: Value) -> Flow {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_start_host_addresses_come_from_the_saved_range_only() {
+        let mut r = FlowRecorder::default();
+        r.begin_capture(None);
+        let nav = |id: &str, url: &str| json!({ "id": id, "action": "navigate", "url": url });
+        r.begin_command("navigate", &nav("1", "http://lvh.me:3000/"), None, None);
+        r.tag_now("before");
+        r.begin_command("navigate", &nav("2", "http://LVH.me:3000/app"), None, None);
+        r.tag_now("start");
+        r.tag_now("other");
+        let at = |id: &str, url: &str, addr: &str| HarEntry {
+            remote_addr: Some(addr.parse().unwrap()),
+            ..entry(id, url, "Fetch", "application/json", "{}")
+        };
+        let entries = vec![
+            at("before", "http://lvh.me:3000/", "93.184.216.34:3000"),
+            at("start", "http://lvh.me:3000/api", "127.0.0.1:3000"),
+            at("other", "https://cdn.example.com/x", "10.0.0.1:443"),
+            at("other", "http://lvh.me:4000/", "127.0.0.1:4000"),
+            at("untagged", "http://lvh.me:3000/late", "8.8.8.8:3000"),
+        ];
+        // By default the save starts at the last navigation.
+        assert_eq!(
+            r.start_host_addresses(None, None, &entries),
+            Some((
+                "lvh.me".to_string(),
+                3000,
+                vec!["127.0.0.1:3000".parse().unwrap()]
+            ))
+        );
+        let (_, _, all) = r.start_host_addresses(Some(1), None, &entries).unwrap();
+        let want: Vec<std::net::SocketAddr> = vec![
+            "93.184.216.34:3000".parse().unwrap(),
+            "127.0.0.1:3000".parse().unwrap(),
+        ];
+        assert_eq!(all, want);
+        // An IP-literal start host needs no recorded reach.
+        let mut lit = FlowRecorder::default();
+        lit.begin_capture(None);
+        lit.begin_command("navigate", &nav("1", "http://10.0.0.5/"), None, None);
+        assert!(lit.start_host_addresses(None, None, &entries).is_none());
+    }
+
+    #[test]
+    fn a_start_host_reached_only_locally_records_a_local_reach() {
+        let names = vec![("lvh.me".to_string(), net::Reach::Loopback)];
+        assert_eq!(
+            recorded_reach("http://lvh.me:3000/x", &names),
+            Some(net::Reach::Loopback)
+        );
+        assert_eq!(
+            recorded_reach("http://LVH.me.:3000/x", &names),
+            Some(net::Reach::Loopback)
+        );
+        // A public start host, or one the URL already marks local, records none.
+        assert_eq!(recorded_reach("https://app.example.com/", &names), None);
+        assert_eq!(
+            recorded_reach(
+                "http://localhost:3000/",
+                &[("localhost".to_string(), net::Reach::Loopback)]
+            ),
+            None
+        );
+    }
+
     fn build_flow_value(input: SaveInput<'_>) -> Result<(Value, Value), String> {
         build_flow(input).map(|(f, r)| (serde_json::to_value(&f).unwrap(), r))
     }
@@ -2079,6 +2236,7 @@ mod tests {
             loading_finished_timestamp: None,
             response_body: Some(body.to_string()),
             response_body_base64: false,
+            remote_addr: None,
         }
     }
 
@@ -2148,6 +2306,7 @@ mod tests {
             output: None,
             created_at: "2026-10-26T00:00:00Z".to_string(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let req = &flow["steps"][0]["requests"][0];
@@ -2192,6 +2351,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap_err();
         assert!(err.contains("no first-party JSON requests"));
@@ -2473,6 +2633,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let saved: Request =
@@ -2556,6 +2717,7 @@ mod tests {
             output: Some("s1r3"),
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let seats = &flow["steps"][0]["requests"][2];
@@ -2604,6 +2766,7 @@ mod tests {
             output,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
     }
 
@@ -2688,6 +2851,7 @@ mod tests {
                 output,
                 created_at: String::new(),
                 login_wall: false,
+                local_names: &[],
             })
         };
         let (flow, _) = save(Some("s2r1")).unwrap();
@@ -3045,6 +3209,7 @@ mod tests {
                 output: Some(output),
                 created_at: String::new(),
                 login_wall: false,
+                local_names: &[],
             })
         };
         let err = save("s2r1").unwrap_err();
@@ -3114,6 +3279,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: true,
+            local_names: &[],
         })
         .unwrap();
         assert!(report["gaps"][0]["reason"]
@@ -3181,6 +3347,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         assert_eq!(report["params"], json!(["keyword"]));
@@ -3326,6 +3493,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let writes = flow["writes"].as_array().unwrap();
@@ -3400,6 +3568,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let text = serde_json::to_string(&flow).unwrap();
@@ -3440,6 +3609,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .is_ok()
     }
@@ -3626,6 +3796,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .map(|(f, _)| f["writes"].clone())
         .unwrap_or_else(|e| json!(e))
@@ -3697,6 +3868,7 @@ mod tests {
             output: Some("s1r1"),
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let writes = flow["writes"].as_array().unwrap();
@@ -3770,6 +3942,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let param = flow["params"]
@@ -3826,6 +3999,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let names: Vec<&str> = flow["params"]
@@ -3989,6 +4163,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         assert_eq!(r.commands[1].1["value"], "{{q}}");
@@ -4170,6 +4345,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let text = serde_json::to_string(&flow).unwrap();
@@ -4221,6 +4397,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap_err();
         assert!(err.contains("POST /api/vault/items"), "{err}");
@@ -4257,6 +4434,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let reasons: Vec<String> = report["gaps"]
@@ -4292,6 +4470,7 @@ mod tests {
                 output: None,
                 created_at: String::new(),
                 login_wall: false,
+                local_names: &[],
             })
             .unwrap_err();
             assert!(!err.contains("91ab"), "{err}");
@@ -4321,6 +4500,7 @@ mod tests {
                 output: None,
                 created_at: String::new(),
                 login_wall: false,
+                local_names: &[],
             })
             .unwrap();
             assert!(!report["gaps"].to_string().contains("91ab"), "{report}");
@@ -4329,6 +4509,153 @@ mod tests {
                 crate::output::format_flow_text(Some("flow_save"), &report).unwrap_or_default();
             assert!(!text.contains("91ab"), "{text}");
         }
+    }
+
+    #[test]
+    fn a_secret_in_a_url_that_does_not_decode_as_utf8_is_still_found() {
+        let secret = "x y%91qq\u{e9}";
+        let mut r = recorded(&[]);
+        r.begin_command(
+            "fill",
+            &json!({ "action": "fill", "selector": "@e1", "value": secret }),
+            None,
+            Some(&traits("text", "", "secret value")),
+        );
+        r.tag_now("save");
+        let mut save = entry(
+            "save",
+            "https://api.example.com.ar/api/echo/x%20y%91qq%C3%A9",
+            "Fetch",
+            "application/json",
+            "{}",
+        );
+        save.method = "GET".to_string();
+        assert!(carries_secret(&save, &r.secrets));
+        let err = build_flow_value(SaveInput {
+            name: "echo",
+            recorder: &r,
+            commands: &r.commands,
+            description: None,
+            entries: &[save],
+            params: &[],
+            output: None,
+            created_at: String::new(),
+            login_wall: false,
+            local_names: &[],
+        })
+        .unwrap_err();
+        assert!(!err.contains("91qq") && !err.contains("%C3%A9"), "{err}");
+    }
+
+    #[test]
+    fn a_secret_in_a_url_that_does_not_decode_as_utf8_is_not_in_the_flow_file() {
+        let secret = "x y%91qq\u{e9}";
+        let mut r = recorded(&[]);
+        r.begin_command(
+            "navigate",
+            &json!({ "action": "navigate", "url": "https://www.example.com.ar/" }),
+            None,
+            None,
+        );
+        r.begin_command(
+            "fill",
+            &json!({ "action": "fill", "selector": "@e1", "value": secret }),
+            None,
+            Some(&traits("text", "", "secret value")),
+        );
+        r.tag_now("echo");
+        r.tag_now("home");
+        let echo = entry(
+            "echo",
+            "https://api.example.com.ar/api/echo/x%20y%91qq%C3%A9",
+            "Fetch",
+            "application/json",
+            r#"{"ok":true}"#,
+        );
+        let home = entry(
+            "home",
+            "https://api.example.com.ar/home",
+            "Fetch",
+            "application/json",
+            r#"{"items":[1]}"#,
+        );
+        let (flow, _) = build_flow_value(SaveInput {
+            name: "echo",
+            recorder: &r,
+            commands: &r.commands,
+            description: None,
+            entries: &[echo, home],
+            params: &[],
+            output: None,
+            created_at: String::new(),
+            login_wall: false,
+            local_names: &[],
+        })
+        .unwrap();
+        let text = flow.to_string();
+        assert!(
+            !text.contains("91qq") && !text.contains("api/echo"),
+            "{text}"
+        );
+    }
+
+    fn echo_flow_text(secret: &str, url: &str) -> (String, String) {
+        let mut r = recorded(&[]);
+        r.begin_command(
+            "navigate",
+            &json!({ "action": "navigate", "url": "https://www.example.com.ar/" }),
+            None,
+            None,
+        );
+        r.begin_command(
+            "fill",
+            &json!({ "action": "fill", "selector": "@e1", "value": secret }),
+            None,
+            Some(&traits("text", "", "secret value")),
+        );
+        r.tag_now("echo");
+        r.tag_now("home");
+        let echo = entry("echo", url, "Fetch", "application/json", r#"{"ok":true}"#);
+        let home = entry(
+            "home",
+            "https://api.example.com.ar/home",
+            "Fetch",
+            "application/json",
+            r#"{"items":[1]}"#,
+        );
+        let (flow, report) = build_flow_value(SaveInput {
+            name: "echo",
+            recorder: &r,
+            commands: &r.commands,
+            description: None,
+            entries: &[echo.clone(), home],
+            params: &[],
+            output: None,
+            created_at: String::new(),
+            login_wall: false,
+            local_names: &[],
+        })
+        .unwrap();
+        let name = dropped_name(&echo, &r.secrets, carries_secret(&echo, &r.secrets));
+        (format!("{flow}{report}"), name)
+    }
+
+    #[test]
+    fn a_secret_next_to_an_undecodable_escape_is_found_in_a_form_value() {
+        let (text, _) =
+            echo_flow_text("a b", "https://api.example.com.ar/api/echo?q=caf%E9&pw=a+b");
+        assert!(
+            !text.contains("pw=a+b") && !text.contains("caf%E9"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_secret_with_a_lowercase_undecodable_escape_is_found() {
+        let (text, name) =
+            echo_flow_text("zz w%e9", "https://api.example.com.ar/api/hangs/zz%20w%e9");
+        assert!(!text.contains("%e9") && !text.contains("zz%20w"), "{text}");
+        assert_eq!(name, "GET /api/hangs/<redacted>");
     }
 
     #[test]
@@ -4359,6 +4686,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap_err();
         assert!(!err.contains("ab12") && !err.contains("cd34"), "{err}");
@@ -4394,6 +4722,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap_err();
         assert!(err.contains("POST api.example.com.ar may carry"), "{err}");
@@ -4502,6 +4831,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let text = serde_json::to_string(&flow).unwrap();
@@ -4599,6 +4929,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let text = serde_json::to_string(&flow).unwrap();
@@ -4734,6 +5065,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let text = serde_json::to_string(&flow).unwrap();
@@ -4840,6 +5172,7 @@ mod tests {
             output: Some("s2r1"),
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let body = flow["steps"][1]["requests"][0]["body"].as_str().unwrap();
@@ -4883,6 +5216,7 @@ mod tests {
             output: None,
             created_at: "2026-11-03T00:00:00Z".to_string(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let path = write_flow(&flow).unwrap();
@@ -5579,6 +5913,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         flow["steps"][1]["requests"][0].clone()
@@ -5700,6 +6035,7 @@ mod tests {
             output: None,
             created_at: String::new(),
             login_wall: false,
+            local_names: &[],
         })
         .unwrap();
         let body: Value =
