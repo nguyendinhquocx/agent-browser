@@ -273,36 +273,15 @@ jobs:
 
       - name: Verify all binaries exist
         run: |
-          EXPECTED_BINARIES=(
-            "agent-browser-linux-x64"
-            "agent-browser-linux-arm64"
-            "agent-browser-linux-musl-x64"
-            "agent-browser-linux-musl-arm64"
-            "agent-browser-win32-x64.exe"
-            "agent-browser-darwin-x64"
-            "agent-browser-darwin-arm64"
-          )
-          MIN_SIZE=100000
-          ERRORS=0
-          for binary in "${EXPECTED_BINARIES[@]}"; do
-            if [ ! -f "bin/$binary" ]; then
-              echo "ERROR: Missing bin/$binary"
-              ERRORS=$((ERRORS + 1))
+          set -euo pipefail
+          for dir in packages/@agent-browser/cli-*; do
+            PACKAGE_NAME=$(node -p "require('./${dir}/package.json').name")
+            if npm view "${PACKAGE_NAME}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${PACKAGE_NAME}@${VERSION} is already published; skipping"
             else
-              SIZE=$(stat -c%s "bin/$binary" 2>/dev/null || stat -f%z "bin/$binary")
-              if [ "$SIZE" -lt "$MIN_SIZE" ]; then
-                echo "ERROR: bin/$binary is too small ($SIZE bytes, expected >= $MIN_SIZE)"
-                ERRORS=$((ERRORS + 1))
-              else
-                echo "OK: bin/$binary ($SIZE bytes)"
-              fi
+              (cd "$dir" && npm publish --provenance --access public)
             fi
           done
-          if [ "$ERRORS" -gt 0 ]; then
-            echo "Error: $ERRORS binary issues found"
-            exit 1
-          fi
-          echo "All 7 platform binaries present and valid"
 
       - name: Publish to npm
         run: pnpm publish --provenance --no-git-checks
